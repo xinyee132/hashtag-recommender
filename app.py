@@ -1,6 +1,5 @@
 import re
 import ast
-import pickle
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -11,6 +10,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.svm import LinearSVC
 from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # =========================================================
 # CONFIG
@@ -28,6 +28,21 @@ SEED = 42
 RECENT_DAYS = 30
 OLDER_DAYS = 90
 TREND_MIN_FREQ = 3
+
+# Final trend-aware settings
+TREND_W_BASE = 0.55
+TREND_W_TREND = 0.20
+TREND_W_CAT = 0.15
+TREND_W_LEX = 0.10
+TREND_GENERIC_PENALTY = 0.12
+
+# Experimental hybrid settings
+HYBRID_W_BASE = 0.40
+HYBRID_W_TREND = 0.20
+HYBRID_W_CAT = 0.10
+HYBRID_W_LEX = 0.10
+HYBRID_W_SEM = 0.20
+HYBRID_GENERIC_PENALTY = 0.12
 
 GENERIC_TAGS = {
     "#ad", "#love", "#instagood", "#photooftheday", "#photography",
@@ -152,6 +167,9 @@ def build_category_affinity(train_df):
 
     return affinity
 
+# =========================================================
+# TREND DETECTION
+# =========================================================
 def prepare_trend_base_df(train_df):
     df = train_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -244,12 +262,52 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     trend_score_dict = dict(zip(trend_df["tag"], trend_df["trend_score"]))
     return trend_df, trend_score_dict
 
+# =========================================================
+# TF-IDF SEMANTIC INDEX
+# =========================================================
+def build_hashtag_texts(train_df):
+    tag_texts = defaultdict(list)
+
+    for _, row in train_df.iterrows():
+        caption = str(row["clean_caption"]).strip().lower()
+        for tag in row["hashtags_list"]:
+            tag_texts[tag].append(caption)
+
+    tag_docs = {tag: " ".join(texts) for tag, texts in tag_texts.items()}
+    return tag_docs
+
+def build_semantic_index(tfidf, train_df):
+    tag_docs = build_hashtag_texts(train_df)
+    tags = list(tag_docs.keys())
+    docs = list(tag_docs.values())
+    tag_vectors = tfidf.transform(docs)
+
+    return {
+        "tags": tags,
+        "tag_docs": tag_docs,
+        "tag_vectors": tag_vectors
+    }
+
+def compute_semantic_scores(system, caption: str, category: str):
+    category = str(category).strip().lower()
+    caption = str(caption).strip().lower()
+    model_text = f"{category} {caption}"
+
+    query_vec = system["tfidf"].transform([model_text])
+    sims = cosine_similarity(query_vec, system["semantic_index"]["tag_vectors"])[0]
+
+    return {tag: float(sim) for tag, sim in zip(system["semantic_index"]["tags"], sims)}
+
+# =========================================================
+# BUILD COMPLETE SYSTEM
+# =========================================================
 @st.cache_resource
 def build_system(csv_path: str):
     df = load_dataset(csv_path)
     train_df, mlb, tfidf, model = prepare_deploy_data(df)
     category_affinity = build_category_affinity(train_df)
     trend_df, trend_score_dict = build_trend_score_table(train_df)
+    semantic_index = build_semantic_index(tfidf, train_df)
 
     return {
         "df": train_df,
@@ -259,6 +317,7 @@ def build_system(csv_path: str):
         "category_affinity": category_affinity,
         "trend_df": trend_df,
         "trend_score_dict": trend_score_dict,
+        "semantic_index": semantic_index,
     }
 
 # =========================================================
@@ -293,7 +352,7 @@ def lexical_rerank(system, caption: str, category: str, candidate_pool=20, top_k
         base_score = cand_norm.get(tag, 0.0)
         cat_score = system["category_affinity"].get(category, {}).get(tag, 0.0)
         lex_score = lexical_similarity(caption, tag)
-        penalty = 0.12 if tag in GENERIC_TAGS else 0.0
+        penalty = TREND_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
 
         final_score = 0.75 * base_score + 0.15 * cat_score + 0.10 * lex_score - penalty
         rows.append({
@@ -321,13 +380,13 @@ def trend_aware_rerank(system, caption: str, category: str, candidate_pool=20, t
         trend_score = float(system["trend_score_dict"].get(tag, 0.0))
         cat_score = system["category_affinity"].get(category, {}).get(tag, 0.0)
         lex_score = lexical_similarity(caption, tag)
-        penalty = 0.12 if tag in GENERIC_TAGS else 0.0
+        penalty = TREND_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
 
         final_score = (
-            0.55 * base_score +
-            0.20 * trend_score +
-            0.15 * cat_score +
-            0.10 * lex_score -
+            TREND_W_BASE * base_score +
+            TREND_W_TREND * trend_score +
+            TREND_W_CAT * cat_score +
+            TREND_W_LEX * lex_score -
             penalty
         )
 
@@ -344,13 +403,50 @@ def trend_aware_rerank(system, caption: str, category: str, candidate_pool=20, t
     rows = sorted(rows, key=lambda x: x["final_score"], reverse=True)
     return [r["tag"] for r in rows[:top_k]], rows
 
-def get_top_category_trends(system, category: str, top_n=10):
-    df = system["trend_df"]
-    if len(df) == 0:
-        return pd.DataFrame()
+def hybrid_rerank(system, caption: str, category: str, candidate_pool=20, top_k=5):
+    category = str(category).strip().lower()
+    caption = str(caption).strip().lower()
 
-    # category trend table on the fly
-    category_rows = []
+    _, cand_scores = raw_predict(system, caption, category, top_k=top_k, candidate_pool=candidate_pool)
+    cand_norm = minmax_normalize_dict(cand_scores)
+
+    semantic_scores_all = compute_semantic_scores(system, caption, category)
+    cand_sem = {tag: semantic_scores_all.get(tag, 0.0) for tag in cand_scores.keys()}
+    cand_sem_norm = minmax_normalize_dict(cand_sem)
+
+    rows = []
+    for tag in cand_scores.keys():
+        base_score = cand_norm.get(tag, 0.0)
+        trend_score = float(system["trend_score_dict"].get(tag, 0.0))
+        cat_score = system["category_affinity"].get(category, {}).get(tag, 0.0)
+        lex_score = lexical_similarity(caption, tag)
+        sem_score = cand_sem_norm.get(tag, 0.0)
+        penalty = HYBRID_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
+
+        final_score = (
+            HYBRID_W_BASE * base_score +
+            HYBRID_W_TREND * trend_score +
+            HYBRID_W_CAT * cat_score +
+            HYBRID_W_LEX * lex_score +
+            HYBRID_W_SEM * sem_score -
+            penalty
+        )
+
+        rows.append({
+            "tag": tag,
+            "final_score": float(final_score),
+            "base_score": float(base_score),
+            "trend_score": float(trend_score),
+            "cat_score": float(cat_score),
+            "lex_score": float(lex_score),
+            "sem_score": float(sem_score),
+            "penalty": float(penalty)
+        })
+
+    rows = sorted(rows, key=lambda x: x["final_score"], reverse=True)
+    return [r["tag"] for r in rows[:top_k]], rows
+
+def get_top_category_trends(system, category: str, top_n=10):
     train_df = system["df"]
     group = train_df[train_df["category"] == category].copy()
     if len(group) == 0:
@@ -362,24 +458,26 @@ def get_top_category_trends(system, category: str, top_n=10):
 # =========================================================
 # STREAMLIT UI
 # =========================================================
-st.set_page_config(page_title="Trend-Aware Hashtag Recommender", layout="wide")
-st.title("Trend-Aware Instagram Hashtag Recommender")
-st.caption("Deployable pipeline: Caption + Category SVM with lexical and trend-aware reranking.")
+st.set_page_config(page_title="Hybrid Hashtag Recommender", layout="wide")
+st.title("Hybrid Instagram Hashtag Recommender")
+st.caption("Caption + Category SVM with lexical, trend-aware, and TF-IDF semantic hybrid reranking.")
 
 system = build_system(str(DATA_PATH))
-
 categories = sorted(system["df"]["category"].dropna().unique().tolist())
 
 left, right = st.columns([1.2, 1])
 
 with left:
     st.subheader("Input")
-    category = st.selectbox("Category", categories, index=categories.index("fitness") if "fitness" in categories else 0)
+    default_idx = categories.index("fitness") if "fitness" in categories else 0
+    category = st.selectbox("Category", categories, index=default_idx)
+
     caption = st.text_area(
         "Caption",
         value="Having a great morning workout at the gym, feeling strong today!",
         height=140
     )
+
     top_k = st.slider("Top hashtags", min_value=3, max_value=10, value=5)
     candidate_pool = st.slider("Candidate pool", min_value=10, max_value=50, value=20, step=5)
 
@@ -404,10 +502,11 @@ if run_btn:
         raw_tags, raw_scores = raw_predict(system, caption, category, top_k=top_k, candidate_pool=candidate_pool)
         lex_tags, lex_rows = lexical_rerank(system, caption, category, candidate_pool=candidate_pool, top_k=top_k)
         trend_tags, trend_rows = trend_aware_rerank(system, caption, category, candidate_pool=candidate_pool, top_k=top_k)
+        hybrid_tags, hybrid_rows = hybrid_rerank(system, caption, category, candidate_pool=candidate_pool, top_k=top_k)
 
         st.subheader("Recommendation Output")
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
 
         with c1:
             st.markdown("**Raw SVM**")
@@ -420,17 +519,25 @@ if run_btn:
                 st.write(f"{i}. {tag}")
 
         with c3:
-            st.markdown("**Trend-Aware Final Output**")
+            st.markdown("**Trend-Aware**")
             for i, tag in enumerate(trend_tags, 1):
                 st.write(f"{i}. {tag}")
 
-        st.subheader("Final Hashtags")
-        st.code(" ".join(trend_tags))
+        with c4:
+            st.markdown("**Hybrid Final Output**")
+            for i, tag in enumerate(hybrid_tags, 1):
+                st.write(f"{i}. {tag}")
 
-        st.subheader("Trend-Aware Scoring Breakdown")
-        trend_breakdown_df = pd.DataFrame(trend_rows[:top_k])
+        st.subheader("Final Hashtags")
+        st.code(" ".join(hybrid_tags))
+
+        st.subheader("Hybrid Scoring Breakdown")
+        hybrid_breakdown_df = pd.DataFrame(hybrid_rows[:top_k])
         st.dataframe(
-            trend_breakdown_df[["tag", "final_score", "base_score", "trend_score", "cat_score", "lex_score", "penalty"]],
+            hybrid_breakdown_df[[
+                "tag", "final_score", "base_score", "trend_score",
+                "cat_score", "lex_score", "sem_score", "penalty"
+            ]],
             use_container_width=True,
             hide_index=True
         )
