@@ -1,4 +1,8 @@
 streamlit
-pandas
 numpy
+pandas
 scikit-learn
+sentence-transformers
+joblib
+torch
+transformers
