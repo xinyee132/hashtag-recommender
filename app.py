@@ -237,7 +237,6 @@ def prepare_experiment_data(df: pd.DataFrame, use_category=True, top_n_hashtags=
 # =========================================================
 # MODEL TRAINING: SVM
 # =========================================================
-@st.cache_resource
 def run_caption_category_svm(exp):
     tfidf = TfidfVectorizer(
         max_features=MAX_FEATURES_TFIDF,
@@ -928,7 +927,6 @@ with tab1:
                     hide_index=True
                 )
 
-
 with tab2:
     st.subheader("Qualitative Comparison")
     selected_sample = st.selectbox(
@@ -953,7 +951,6 @@ with tab2:
 
     compare_df = pd.DataFrame(compare_data)
     st.dataframe(compare_df, use_container_width=True, hide_index=True)
-
 
 with tab3:
     st.subheader("Evaluation Demo")
