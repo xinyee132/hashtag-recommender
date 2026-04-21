@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 import streamlit as st
+import gdown
 
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -15,6 +16,9 @@ from sklearn.multiclass import OneVsRestClassifier
 from sklearn.svm import LinearSVC
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+from tensorflow.keras.models import model_from_json
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 # =========================================================
 # PAGE CONFIG
@@ -27,6 +31,7 @@ st.set_page_config(page_title="FYP Hashtag Recommender Demo", layout="wide")
 BASE_DIR = Path(".")
 DATA_PATH = BASE_DIR / "instagram_dataset_tfidf_ready.csv"
 MODEL_DIR = BASE_DIR / "saved_models"
+MODEL_DIR.mkdir(exist_ok=True)
 
 TOP_N_HASHTAGS = 400
 MAX_FEATURES_TFIDF = 2000
@@ -63,6 +68,8 @@ SAMPLE_CAPTIONS = [
     ("Sunset view at the beach during vacation", "travel"),
     ("New outfit for the weekend brunch", "fashion"),
 ]
+
+TEXTCNN_GDRIVE_FILE_ID = "1k5dgxPeLGezw07l390tp76QLE3N73e1K"
 
 # =========================================================
 # HELPERS
@@ -123,7 +130,7 @@ def lexical_similarity(caption, tag):
 
 
 # =========================================================
-# OPTIONAL MODEL LOADER: SBERT + LR
+# OPTIONAL MODEL LOADERS
 # =========================================================
 @st.cache_resource
 def load_sbert_lr_bundle(export_dir=MODEL_DIR):
@@ -153,10 +160,65 @@ def load_sbert_lr_bundle(export_dir=MODEL_DIR):
     }
 
 
+@st.cache_resource
+def download_textcnn_weights():
+    output_path = MODEL_DIR / "textcnn_glove.weights.h5"
+
+    if not output_path.exists():
+        url = f"https://drive.google.com/uc?id={TEXTCNN_GDRIVE_FILE_ID}"
+        gdown.download(url, str(output_path), quiet=False)
+
+    return output_path
+
+
+@st.cache_resource
+def load_textcnn_glove_bundle(export_dir=MODEL_DIR):
+    export_dir = Path(export_dir)
+
+    arch_path = export_dir / "textcnn_glove_arch.json"
+    meta_path = export_dir / "textcnn_glove_meta.pkl"
+
+    if not arch_path.exists() or not meta_path.exists():
+        return None
+
+    try:
+        weights_path = download_textcnn_weights()
+    except Exception:
+        return None
+
+    if not Path(weights_path).exists():
+        return None
+
+    with open(arch_path, "r") as f:
+        model_json = f.read()
+
+    model = model_from_json(model_json)
+    model.load_weights(str(weights_path))
+
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f)
+
+    return {
+        "name": meta.get("name", "textcnn_glove"),
+        "display_name": meta.get("display_name", "TEXTCNN + GloVe"),
+        "model": model,
+        "vectorizer": meta["vectorizer"],
+        "mlb": meta["mlb"],
+        "use_category": meta["use_category"],
+        "model_type": meta["model_type"],   # nn
+        "max_len": meta["max_len"],
+    }
+
+
 def register_optional_bundles(models_dict):
     sbert_bundle = load_sbert_lr_bundle()
     if sbert_bundle is not None:
         models_dict["SBERT + LR"] = sbert_bundle
+
+    textcnn_bundle = load_textcnn_glove_bundle()
+    if textcnn_bundle is not None:
+        models_dict["TEXTCNN + GloVe"] = textcnn_bundle
+
     return models_dict
 
 
@@ -237,7 +299,8 @@ def prepare_experiment_data(df: pd.DataFrame, use_category=True, top_n_hashtags=
 # =========================================================
 # MODEL TRAINING: SVM
 # =========================================================
-def run_caption_category_svm(exp):
+@st.cache_resource
+def train_svm_bundle(train_texts, y_train, mlb):
     tfidf = TfidfVectorizer(
         max_features=MAX_FEATURES_TFIDF,
         ngram_range=(1, 1),
@@ -246,18 +309,18 @@ def run_caption_category_svm(exp):
         max_df=MAX_DF,
     )
 
-    X_train = tfidf.fit_transform(exp["train_df"]["model_text"])
+    X_train = tfidf.fit_transform(train_texts)
 
     base = LinearSVC(C=SVM_C, dual=False, max_iter=3000, random_state=SEED)
     model = OneVsRestClassifier(base)
-    model.fit(X_train, exp["y_train"])
+    model.fit(X_train, y_train)
 
     return {
         "name": "caption_category_svm",
         "display_name": "SVM",
         "model": model,
         "vectorizer": tfidf,
-        "mlb": exp["mlb"],
+        "mlb": mlb,
         "use_category": True,
         "model_type": "sklearn",
     }
@@ -406,7 +469,11 @@ def build_system(csv_path: str):
     df = load_dataset(csv_path)
     exp = prepare_experiment_data(df, use_category=True, top_n_hashtags=TOP_N_HASHTAGS)
 
-    svm_bundle = run_caption_category_svm(exp)
+    svm_bundle = train_svm_bundle(
+        tuple(exp["train_df"]["model_text"].tolist()),
+        exp["y_train"],
+        exp["mlb"]
+    )
 
     models = {
         "SVM": svm_bundle
@@ -427,7 +494,6 @@ def build_system(csv_path: str):
         "semantic_index": semantic_index
     }
 
-
 # =========================================================
 # GENERIC BUNDLE SCORING
 # =========================================================
@@ -444,6 +510,10 @@ def get_bundle_scores(bundle, caption: str, category: str):
         X = bundle["vectorizer"].transform([model_text])
         scores = bundle["model"].decision_function(X)[0]
 
+    elif bundle["model_type"] == "sklearn_proba":
+        X = bundle["vectorizer"].transform([model_text])
+        scores = bundle["model"].predict_proba(X)[0]
+
     elif bundle["model_type"] == "embedding_clf":
         X = bundle["vectorizer"].encode(
             [model_text],
@@ -459,6 +529,14 @@ def get_bundle_scores(bundle, caption: str, category: str):
             normalize_embeddings=True
         )
         scores = bundle["model"].predict_proba(X)[0]
+
+    elif bundle["model_type"] == "nn":
+        max_len = bundle.get("max_len")
+        if max_len is None:
+            raise ValueError("NN bundle must include 'max_len'.")
+        X = bundle["vectorizer"].texts_to_sequences([model_text])
+        X = pad_sequences(X, maxlen=max_len)
+        scores = bundle["model"].predict(X, verbose=0)[0]
 
     else:
         raise ValueError(f"Unsupported model_type: {bundle['model_type']}")
@@ -480,22 +558,30 @@ def raw_predict(system, model_key: str, caption: str, category: str, top_k=5, ca
     cand_tags = [bundle["mlb"].classes_[i] for i in cand_idx]
     cand_scores = {tag: float(scores[i]) for tag, i in zip(cand_tags, cand_idx)}
 
-    return tags, cand_scores
+    rows = [{"tag": tag, "base_score": score} for tag, score in cand_scores.items()]
+    return tags, rows
 
 
 def lexical_rerank(system, model_key: str, caption: str, category: str, candidate_pool=20, top_k=5):
-    _, cand_scores = raw_predict(system, model_key, caption, category, top_k=top_k, candidate_pool=candidate_pool)
-    cand_norm = minmax_normalize_dict(cand_scores)
+    bundle = system["models"][model_key]
     category = str(category).strip().lower()
 
+    scores = get_bundle_scores(bundle, caption, category)
+    candidates_idx = np.argsort(scores)[::-1][:candidate_pool]
+    cand_tags = [bundle["mlb"].classes_[i] for i in candidates_idx]
+
+    cand_base = {tag: float(scores[i]) for tag, i in zip(cand_tags, candidates_idx)}
+    cand_base_norm = minmax_normalize_dict(cand_base)
+
     rows = []
-    for tag in cand_scores.keys():
-        base_score = cand_norm.get(tag, 0.0)
+    for tag in cand_tags:
+        base_score = cand_base_norm.get(tag, 0.0)
         cat_score = system["category_affinity"].get(category, {}).get(tag, 0.0)
         lex_score = lexical_similarity(caption, tag)
         penalty = TREND_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
 
         final_score = 0.75 * base_score + 0.15 * cat_score + 0.10 * lex_score - penalty
+
         rows.append({
             "tag": tag,
             "final_score": float(final_score),
@@ -510,13 +596,19 @@ def lexical_rerank(system, model_key: str, caption: str, category: str, candidat
 
 
 def trend_aware_rerank(system, model_key: str, caption: str, category: str, candidate_pool=20, top_k=5):
-    _, cand_scores = raw_predict(system, model_key, caption, category, top_k=top_k, candidate_pool=candidate_pool)
-    cand_norm = minmax_normalize_dict(cand_scores)
+    bundle = system["models"][model_key]
     category = str(category).strip().lower()
 
+    scores = get_bundle_scores(bundle, caption, category)
+    candidates_idx = np.argsort(scores)[::-1][:candidate_pool]
+    cand_tags = [bundle["mlb"].classes_[i] for i in candidates_idx]
+
+    cand_base = {tag: float(scores[i]) for tag, i in zip(cand_tags, candidates_idx)}
+    cand_base_norm = minmax_normalize_dict(cand_base)
+
     rows = []
-    for tag in cand_scores.keys():
-        base_score = cand_norm.get(tag, 0.0)
+    for tag in cand_tags:
+        base_score = cand_base_norm.get(tag, 0.0)
         trend_score = float(system["trend_score_dict"].get(tag, 0.0))
         cat_score = system["category_affinity"].get(category, {}).get(tag, 0.0)
         lex_score = lexical_similarity(caption, tag)
@@ -554,16 +646,23 @@ def compute_semantic_scores(system, caption: str, category: str):
 
 def hybrid_rerank(system, caption: str, category: str, candidate_pool=20, top_k=5):
     model_key = "SVM"
-    _, cand_scores = raw_predict(system, model_key, caption, category, top_k=top_k, candidate_pool=candidate_pool)
-    cand_norm = minmax_normalize_dict(cand_scores)
-    semantic_scores_all = compute_semantic_scores(system, caption, category)
-    cand_sem = {tag: semantic_scores_all.get(tag, 0.0) for tag in cand_scores.keys()}
-    cand_sem_norm = minmax_normalize_dict(cand_sem)
+    bundle = system["models"][model_key]
     category = str(category).strip().lower()
 
+    scores = get_bundle_scores(bundle, caption, category)
+    candidates_idx = np.argsort(scores)[::-1][:candidate_pool]
+    cand_tags = [bundle["mlb"].classes_[i] for i in candidates_idx]
+
+    cand_base = {tag: float(scores[i]) for tag, i in zip(cand_tags, candidates_idx)}
+    cand_base_norm = minmax_normalize_dict(cand_base)
+
+    semantic_scores_all = compute_semantic_scores(system, caption, category)
+    cand_sem = {tag: semantic_scores_all.get(tag, 0.0) for tag in cand_tags}
+    cand_sem_norm = minmax_normalize_dict(cand_sem)
+
     rows = []
-    for tag in cand_scores.keys():
-        base_score = cand_norm.get(tag, 0.0)
+    for tag in cand_tags:
+        base_score = cand_base_norm.get(tag, 0.0)
         trend_score = float(system["trend_score_dict"].get(tag, 0.0))
         cat_score = system["category_affinity"].get(category, {}).get(tag, 0.0)
         lex_score = lexical_similarity(caption, tag)
@@ -767,6 +866,12 @@ def run_demo_evaluation(system):
         test_results["sbert_raw"] = evaluate_rank_metrics(exp["y_test"], get_raw_scores(system, "SBERT + LR", "test"))
         test_results["sbert_trend"] = evaluate_rank_metrics(exp["y_test"], get_trend_scores(system, "SBERT + LR", "test"))
 
+    if "TEXTCNN + GloVe" in system["models"]:
+        val_results["textcnn_raw"] = evaluate_rank_metrics(exp["y_val"], get_raw_scores(system, "TEXTCNN + GloVe", "val"))
+        val_results["textcnn_trend"] = evaluate_rank_metrics(exp["y_val"], get_trend_scores(system, "TEXTCNN + GloVe", "val"))
+        test_results["textcnn_raw"] = evaluate_rank_metrics(exp["y_test"], get_raw_scores(system, "TEXTCNN + GloVe", "test"))
+        test_results["textcnn_trend"] = evaluate_rank_metrics(exp["y_test"], get_trend_scores(system, "TEXTCNN + GloVe", "test"))
+
     val_df = summarize_results(val_results, "val")
     test_df = summarize_results(test_results, "test")
     return pd.concat([val_df, test_df], ignore_index=True)
@@ -787,6 +892,12 @@ def get_pipeline_options(system):
         options += [
             "SBERT + LR Raw",
             "SBERT + LR Trend-aware",
+        ]
+
+    if "TEXTCNN + GloVe" in system["models"]:
+        options += [
+            "TEXTCNN + GloVe Raw",
+            "TEXTCNN + GloVe Trend-aware",
         ]
 
     return options
@@ -813,6 +924,13 @@ def run_selected_pipeline(system, pipeline_name, caption, category, top_k=5, can
     if pipeline_name == "SBERT + LR Trend-aware":
         return trend_aware_rerank(system, "SBERT + LR", caption, category, candidate_pool, top_k), "trend"
 
+    if pipeline_name == "TEXTCNN + GloVe Raw":
+        tags, rows = raw_predict(system, "TEXTCNN + GloVe", caption, category, top_k, candidate_pool)
+        return (tags, rows), "raw"
+
+    if pipeline_name == "TEXTCNN + GloVe Trend-aware":
+        return trend_aware_rerank(system, "TEXTCNN + GloVe", caption, category, candidate_pool, top_k), "trend"
+
     raise ValueError(f"Unknown pipeline: {pipeline_name}")
 
 
@@ -820,7 +938,10 @@ def run_selected_pipeline(system, pipeline_name, caption, category, top_k=5, can
 # UI
 # =========================================================
 st.title("FYP Hashtag Recommender Demo")
-st.caption("Final deployed model: SVM + Trend-aware reranking. SBERT + LR is included as a comparison model.")
+st.caption(
+    "Final deployed model: SVM + Trend-aware reranking. "
+    "SBERT + LR and TEXTCNN + GloVe are included as comparison models when available."
+)
 
 system = build_system(str(DATA_PATH))
 categories = sorted(system["exp"]["train_df"]["category"].dropna().unique().tolist())
@@ -927,6 +1048,15 @@ with tab1:
                     hide_index=True
                 )
 
+            else:
+                st.subheader("Selected Pipeline Scores")
+                st.dataframe(
+                    pd.DataFrame(selected_rows[:top_k]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+
 with tab2:
     st.subheader("Qualitative Comparison")
     selected_sample = st.selectbox(
@@ -949,8 +1079,13 @@ with tab2:
         compare_data["SBERT_RAW"] = raw_predict(system, "SBERT + LR", sample_caption, sample_category, top_k=5, candidate_pool=20)[0]
         compare_data["SBERT_TREND"] = trend_aware_rerank(system, "SBERT + LR", sample_caption, sample_category, candidate_pool=20, top_k=5)[0]
 
+    if "TEXTCNN + GloVe" in system["models"]:
+        compare_data["TEXTCNN_RAW"] = raw_predict(system, "TEXTCNN + GloVe", sample_caption, sample_category, top_k=5, candidate_pool=20)[0]
+        compare_data["TEXTCNN_TREND"] = trend_aware_rerank(system, "TEXTCNN + GloVe", sample_caption, sample_category, candidate_pool=20, top_k=5)[0]
+
     compare_df = pd.DataFrame(compare_data)
     st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
 
 with tab3:
     st.subheader("Evaluation Demo")
@@ -965,6 +1100,6 @@ with tab3:
         st.markdown("**Suggested interpretation**")
         st.write(
             "Use this table to show that the deployed model is SVM + Trend-aware reranking, "
-            "while SBERT + LR is included as a comparison pipeline. "
-            "The SVM hybrid pipeline is shown as an experimental semantic extension."
+            "while SBERT + LR and TEXTCNN + GloVe are comparison pipelines. "
+            "The SVM hybrid pipeline is presented as an experimental semantic extension."
         )
