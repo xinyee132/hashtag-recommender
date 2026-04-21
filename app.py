@@ -17,6 +17,11 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # =========================================================
+# PAGE CONFIG
+# =========================================================
+st.set_page_config(page_title="Hybrid Hashtag Recommendation Demo", layout="wide")
+
+# =========================================================
 # CONFIG
 # =========================================================
 BASE_DIR = Path(".")
@@ -34,6 +39,7 @@ RECENT_DAYS = 30
 OLDER_DAYS = 90
 TREND_MIN_FREQ = 3
 
+# Final hybrid weights
 W_BASE = 0.35
 W_SEM = 0.25
 W_TREND = 0.15
@@ -46,6 +52,13 @@ GENERIC_TAGS = {
     "#happy", "#happiness", "#life", "#beautiful", "#art", "#support"
 }
 
+SAMPLE_CAPTIONS = [
+    ("Having a great morning workout at the gym, feeling strong today!", "fitness"),
+    ("Enjoying a delicious homemade vegan pasta for dinner", "food"),
+    ("Sunset view at the beach during vacation", "travel"),
+    ("New outfit for the weekend brunch", "fashion"),
+]
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -55,20 +68,23 @@ def safe_parse(x):
     except Exception:
         return []
 
-def tokenize(text):
+
+def tokenize(text: str):
     text = str(text).lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text.split()
 
-def hashtag_token(tag):
+
+def hashtag_token(tag: str):
     tag = str(tag).lower().replace("#", "")
     tag = re.sub(r"[_\-]", " ", tag)
     tag = re.sub(r"[^a-z0-9\s]", "", tag)
     tag = re.sub(r"\s+", " ", tag).strip()
     return tag
 
-def lexical_similarity(caption, tag):
+
+def lexical_similarity(caption: str, tag: str):
     words = set(tokenize(caption))
     token = hashtag_token(tag)
 
@@ -81,27 +97,72 @@ def lexical_similarity(caption, tag):
 
     return 0.0
 
+
 def minmax_normalize_dict(d):
     if not d:
         return {}
+
     values = np.array(list(d.values()), dtype=float)
     mn, mx = values.min(), values.max()
+
     if mx - mn == 0:
         return {k: 0.0 for k in d}
+
     return {k: (v - mn) / (mx - mn) for k, v in d.items()}
+
 
 def minmax_col(series):
     series = series.astype(float)
     mn, mx = series.min(), series.max()
+
     if mx - mn == 0:
         return pd.Series(np.zeros(len(series)), index=series.index)
+
     return (series - mn) / (mx - mn)
 
+
+def get_model_text(use_category: bool, caption: str, category: str):
+    caption = str(caption).strip().lower()
+    category = str(category).strip().lower()
+    return f"{category} {caption}" if use_category else caption
+
+
 # =========================================================
-# DATA
+# OPTIONAL MODEL LOADER: SBERT + LR
+# =========================================================
+@st.cache_resource
+def load_sbert_lr_bundle(export_dir=MODEL_DIR):
+    export_dir = Path(export_dir)
+
+    clf_path = export_dir / "sbert_lr_clf.joblib"
+    meta_path = export_dir / "sbert_lr_meta.pkl"
+
+    if not clf_path.exists() or not meta_path.exists():
+        return None
+
+    clf = joblib.load(clf_path)
+
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f)
+
+    embedder = SentenceTransformer(meta["model_name"])
+
+    return {
+        "name": "sbert_lr",
+        "display_name": "SBERT + LR",
+        "model": clf,
+        "vectorizer": embedder,
+        "mlb": meta["mlb"],
+        "use_category": meta["use_category"],
+        "model_type": meta["model_type"],  # expected: embedding_clf_proba
+    }
+
+
+# =========================================================
+# DATA LOADING
 # =========================================================
 @st.cache_data
-def load_dataset(csv_path):
+def load_dataset(csv_path: str):
     df = pd.read_csv(csv_path)
     df["hashtags_list"] = df["hashtags_list"].apply(safe_parse)
     df["clean_caption"] = df["clean_caption"].fillna("")
@@ -119,12 +180,18 @@ def load_dataset(csv_path):
 
     return df
 
-def prepare_experiment_data(df, use_category=True, top_n_hashtags=TOP_N_HASHTAGS):
+
+# =========================================================
+# EXPERIMENT PREP
+# =========================================================
+def prepare_experiment_data(df: pd.DataFrame, use_category=True, top_n_hashtags=TOP_N_HASHTAGS):
     all_tags = [tag for tags in df["hashtags_list"] for tag in tags]
-    top_tags = set([tag for tag, _ in Counter(all_tags).most_common(top_n_hashtags)])
+    top_tags = set(tag for tag, _ in Counter(all_tags).most_common(top_n_hashtags))
 
     work_df = df.copy()
-    work_df["hashtags_list"] = work_df["hashtags_list"].apply(lambda tags: [t for t in tags if t in top_tags])
+    work_df["hashtags_list"] = work_df["hashtags_list"].apply(
+        lambda tags: [t for t in tags if t in top_tags]
+    )
     work_df = work_df[work_df["hashtags_list"].map(len) > 0].reset_index(drop=True)
 
     if use_category:
@@ -161,11 +228,12 @@ def prepare_experiment_data(df, use_category=True, top_n_hashtags=TOP_N_HASHTAGS
         "y_val": y_val,
         "y_test": y_test,
         "mlb": mlb,
-        "use_category": use_category
+        "use_category": use_category,
     }
 
+
 # =========================================================
-# MODEL LOADERS
+# MODEL TRAINING: SVM
 # =========================================================
 @st.cache_resource
 def load_svm_bundle(_exp):
@@ -176,6 +244,7 @@ def load_svm_bundle(_exp):
         min_df=MIN_DF,
         max_df=MAX_DF,
     )
+
     X_train = tfidf.fit_transform(_exp["train_df"]["model_text"])
 
     base = LinearSVC(C=SVM_C, dual=False, max_iter=3000, random_state=SEED)
@@ -183,34 +252,15 @@ def load_svm_bundle(_exp):
     model.fit(X_train, _exp["y_train"])
 
     return {
+        "name": "svm",
+        "display_name": "SVM",
         "model": model,
         "vectorizer": tfidf,
         "mlb": _exp["mlb"],
         "use_category": True,
+        "model_type": "sklearn",
     }
 
-@st.cache_resource
-def load_sbert_bundle(export_dir=MODEL_DIR):
-    export_dir = Path(export_dir)
-    clf_path = export_dir / "sbert_lr_clf.joblib"
-    meta_path = export_dir / "sbert_lr_meta.pkl"
-
-    if not clf_path.exists() or not meta_path.exists():
-        return None
-
-    clf = joblib.load(clf_path)
-    with open(meta_path, "rb") as f:
-        meta = pickle.load(f)
-
-    embedder = SentenceTransformer(meta["model_name"])
-
-    return {
-        "model": clf,
-        "vectorizer": embedder,
-        "mlb": meta["mlb"],
-        "use_category": meta["use_category"],
-        "model_type": meta["model_type"]
-    }
 
 # =========================================================
 # SUPPORT TABLES
@@ -228,7 +278,9 @@ def build_category_affinity(train_df):
         total = sum(counter.values())
         for tag, cnt in counter.items():
             affinity[cat][tag] = cnt / total if total > 0 else 0.0
+
     return affinity
+
 
 def prepare_trend_base_df(train_df):
     df = train_df.copy()
@@ -237,8 +289,10 @@ def prepare_trend_base_df(train_df):
     df["engagement"] = df["likes"].fillna(0) + df["comment_count"].fillna(0)
     return df
 
+
 def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_DAYS, min_freq=TREND_MIN_FREQ):
     df = prepare_trend_base_df(train_df)
+
     if len(df) == 0:
         return pd.DataFrame(columns=["tag", "trend_score"]), {}
 
@@ -273,10 +327,12 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
 
     rows = []
     all_tags = set(recent_counts.keys()) | set(older_counts.keys())
+
     for tag in all_tags:
         r_count = recent_counts.get(tag, 0)
         o_count = older_counts.get(tag, 0)
         total_freq = r_count + o_count
+
         if total_freq < min_freq:
             continue
 
@@ -291,10 +347,11 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
             "tag": tag,
             "velocity": velocity,
             "engagement_growth": engagement_growth,
-            "recency_score": recency_score
+            "recency_score": recency_score,
         })
 
     trend_df = pd.DataFrame(rows)
+
     if len(trend_df) == 0:
         return pd.DataFrame(columns=["tag", "trend_score"]), {}
 
@@ -309,7 +366,8 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     )
 
     trend_score_dict = dict(zip(trend_df["tag"], trend_df["trend_score"]))
-    return trend_df, trend_score_dict
+    return trend_df.sort_values("trend_score", ascending=False).reset_index(drop=True), trend_score_dict
+
 
 def build_hashtag_prototypes(train_df):
     hashtag_caption_tokens = defaultdict(Counter)
@@ -318,12 +376,14 @@ def build_hashtag_prototypes(train_df):
     for _, row in train_df.iterrows():
         cat = row["category"]
         tokens = tokenize(row["clean_caption"])
+
         for tag in row["hashtags_list"]:
             hashtag_category_counts[tag][cat] += 1
             hashtag_caption_tokens[tag].update(tokens)
 
     all_tags = sorted(set(tag for tags in train_df["hashtags_list"] for tag in tags))
     prototypes = {}
+
     for tag in all_tags:
         token = hashtag_token(tag)
         top_words = [w for w, _ in hashtag_caption_tokens[tag].most_common(12)]
@@ -332,9 +392,10 @@ def build_hashtag_prototypes(train_df):
 
     return all_tags, prototypes
 
+
 @st.cache_resource
-def build_sbert_semantic_index(train_df):
-    all_tags, prototypes = build_hashtag_prototypes(train_df)
+def build_sbert_semantic_index(_train_df):
+    all_tags, prototypes = build_hashtag_prototypes(_train_df)
     embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     hashtag_embeddings = embedder.encode(
         [prototypes[t] for t in all_tags],
@@ -344,43 +405,60 @@ def build_sbert_semantic_index(train_df):
     )
     return embedder, all_tags, hashtag_embeddings
 
+
 # =========================================================
 # SCORING
 # =========================================================
-def get_model_text(use_category, caption, category):
-    caption = str(caption).strip().lower()
-    category = str(category).strip().lower()
-    return f"{category} {caption}" if use_category else caption
-
 def svm_candidate_scores(bundle, caption, category):
     model_text = get_model_text(bundle["use_category"], caption, category)
     X = bundle["vectorizer"].transform([model_text])
     return bundle["model"].decision_function(X)[0]
 
+
 def sbert_semantic_scores(caption, category, use_category, embedder, all_tags, hashtag_embeddings):
     model_text = get_model_text(use_category, caption, category)
-    query_emb = embedder.encode([model_text], convert_to_numpy=True, normalize_embeddings=True)
+    query_emb = embedder.encode(
+        [model_text],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
     sims = cosine_similarity(query_emb, hashtag_embeddings)[0]
     return {tag: float(sim) for tag, sim in zip(all_tags, sims)}
 
-def hybrid_rerank(bundle, exp, caption, category, trend_score_dict, category_affinity,
-                  embedder, all_tags, hashtag_embeddings, candidate_pool=20, top_k=5):
-    raw_scores = svm_candidate_scores(bundle, caption, category)
-    candidates_idx = np.argsort(raw_scores)[::-1][:candidate_pool]
-    cand_tags = [bundle["mlb"].classes_[i] for i in candidates_idx]
 
-    base_dict = {tag: float(raw_scores[i]) for tag, i in zip(cand_tags, candidates_idx)}
+def hybrid_rerank(
+    bundle,
+    caption,
+    category,
+    trend_score_dict,
+    category_affinity,
+    embedder,
+    all_tags,
+    hashtag_embeddings,
+    candidate_pool=20,
+    top_k=5,
+):
+    raw_scores = svm_candidate_scores(bundle, caption, category)
+    candidate_idx = np.argsort(raw_scores)[::-1][:candidate_pool]
+    cand_tags = [bundle["mlb"].classes_[i] for i in candidate_idx]
+
+    base_dict = {tag: float(raw_scores[i]) for tag, i in zip(cand_tags, candidate_idx)}
     base_norm = minmax_normalize_dict(base_dict)
 
     sem_all = sbert_semantic_scores(
-        caption, category, bundle["use_category"],
-        embedder, all_tags, hashtag_embeddings
+        caption,
+        category,
+        bundle["use_category"],
+        embedder,
+        all_tags,
+        hashtag_embeddings,
     )
     sem_dict = {tag: sem_all.get(tag, 0.0) for tag in cand_tags}
     sem_norm = minmax_normalize_dict(sem_dict)
 
     category = str(category).strip().lower()
     rows = []
+
     for tag in cand_tags:
         base_score = base_norm.get(tag, 0.0)
         sem_score = sem_norm.get(tag, 0.0)
@@ -400,63 +478,195 @@ def hybrid_rerank(bundle, exp, caption, category, trend_score_dict, category_aff
 
         rows.append({
             "tag": tag,
-            "final_score": final_score,
-            "base_score": base_score,
-            "sem_score": sem_score,
-            "trend_score": trend_score,
-            "cat_score": cat_score,
-            "lex_score": lex_score,
-            "penalty": penalty
+            "final_score": float(final_score),
+            "base_score": float(base_score),
+            "sem_score": float(sem_score),
+            "trend_score": float(trend_score),
+            "cat_score": float(cat_score),
+            "lex_score": float(lex_score),
+            "penalty": float(penalty),
         })
 
     rows = sorted(rows, key=lambda x: x["final_score"], reverse=True)
     return [r["tag"] for r in rows[:top_k]], rows
 
-# =========================================================
-# STREAMLIT APP
-# =========================================================
-st.title("Hybrid Hashtag Recommendation Demo")
-st.caption("IR-faithful deployment: SVM candidate generation + SBERT semantic reranking + trend-aware scoring")
 
-df = load_dataset(str(DATA_PATH))
-exp = prepare_experiment_data(df)
-svm_bundle = load_svm_bundle(exp)
-sbert_lr_bundle = load_sbert_lr_bundle()
+def sbert_lr_predict(bundle, caption, category, top_k=5):
+    model_text = get_model_text(bundle["use_category"], caption, category)
 
-category_affinity = build_category_affinity(exp["train_df"])
-_, trend_score_dict = build_trend_score_table(exp["train_df"])
-embedder_sem, all_tags_sem, hashtag_embeddings_sem = build_sbert_semantic_index(exp["train_df"])
-
-categories = sorted(exp["train_df"]["category"].dropna().unique().tolist())
-
-category = st.selectbox("Category", categories)
-caption = st.text_area("Caption", "Having a great morning workout at the gym, feeling strong today!")
-top_k = st.slider("Top K", 3, 10, 5)
-candidate_pool = st.slider("Candidate Pool", 10, 50, 20, step=5)
-
-if st.button("Recommend"):
-    tags, rows = hybrid_rerank(
-        svm_bundle, exp, caption, category,
-        trend_score_dict, category_affinity,
-        embedder_sem, all_tags_sem, hashtag_embeddings_sem,
-        candidate_pool=candidate_pool, top_k=top_k
-    )
-
-    st.subheader("Final Recommended Hashtags")
-    st.code(" ".join(tags))
-
-    st.subheader("Scoring Breakdown")
-    st.dataframe(pd.DataFrame(rows[:top_k]), use_container_width=True, hide_index=True)
-
-    if sbert_lr_bundle is not None:
-        st.subheader("SBERT + LR Comparison")
-        model_text = get_model_text(sbert_lr_bundle["use_category"], caption, category)
-        X = sbert_lr_bundle["vectorizer"].encode(
+    if bundle["model_type"] == "embedding_clf_proba":
+        X = bundle["vectorizer"].encode(
             [model_text],
             convert_to_numpy=True,
             normalize_embeddings=True
         )
-        sbert_scores = sbert_lr_bundle["model"].predict_proba(X)[0]
-        top_idx = np.argsort(sbert_scores)[::-1][:top_k]
-        sbert_tags = [sbert_lr_bundle["mlb"].classes_[i] for i in top_idx]
-        st.write(sbert_tags)
+        scores = bundle["model"].predict_proba(X)[0]
+    elif bundle["model_type"] == "embedding_clf":
+        X = bundle["vectorizer"].encode(
+            [model_text],
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+        scores = bundle["model"].decision_function(X)[0]
+    else:
+        raise ValueError(f"Unsupported SBERT model_type: {bundle['model_type']}")
+
+    top_idx = np.argsort(scores)[::-1][:top_k]
+    return [bundle["mlb"].classes_[i] for i in top_idx]
+
+
+# =========================================================
+# BUILD APP OBJECTS
+# =========================================================
+@st.cache_resource
+def build_app_objects(csv_path: str):
+    df = load_dataset(csv_path)
+    exp = prepare_experiment_data(df, use_category=True, top_n_hashtags=TOP_N_HASHTAGS)
+    svm_bundle = load_svm_bundle(exp)
+    category_affinity = build_category_affinity(exp["train_df"])
+    trend_df, trend_score_dict = build_trend_score_table(exp["train_df"])
+    embedder_sem, all_tags_sem, hashtag_embeddings_sem = build_sbert_semantic_index(exp["train_df"])
+
+    # Safe optional load
+    try:
+        sbert_lr_bundle = load_sbert_lr_bundle()
+    except Exception:
+        sbert_lr_bundle = None
+
+    return {
+        "df": df,
+        "exp": exp,
+        "svm_bundle": svm_bundle,
+        "category_affinity": category_affinity,
+        "trend_df": trend_df,
+        "trend_score_dict": trend_score_dict,
+        "embedder_sem": embedder_sem,
+        "all_tags_sem": all_tags_sem,
+        "hashtag_embeddings_sem": hashtag_embeddings_sem,
+        "sbert_lr_bundle": sbert_lr_bundle,
+    }
+
+
+# =========================================================
+# APP
+# =========================================================
+st.title("Hybrid Hashtag Recommendation Demo")
+st.caption("IR-faithful deployment: SVM candidate generation + SBERT semantic reranking + trend-aware scoring")
+
+app_objects = build_app_objects(str(DATA_PATH))
+
+exp = app_objects["exp"]
+svm_bundle = app_objects["svm_bundle"]
+trend_df = app_objects["trend_df"]
+trend_score_dict = app_objects["trend_score_dict"]
+category_affinity = app_objects["category_affinity"]
+embedder_sem = app_objects["embedder_sem"]
+all_tags_sem = app_objects["all_tags_sem"]
+hashtag_embeddings_sem = app_objects["hashtag_embeddings_sem"]
+sbert_lr_bundle = app_objects["sbert_lr_bundle"]
+
+categories = sorted(exp["train_df"]["category"].dropna().unique().tolist())
+
+tab1, tab2 = st.tabs(["Single Prediction", "Qualitative Demo"])
+
+with tab1:
+    left, right = st.columns([1.2, 1])
+
+    with left:
+        default_idx = categories.index("fitness") if "fitness" in categories else 0
+        category = st.selectbox("Category", categories, index=default_idx)
+        caption = st.text_area(
+            "Caption",
+            value="Having a great morning workout at the gym, feeling strong today!",
+            height=140
+        )
+        top_k = st.slider("Top hashtags", min_value=3, max_value=10, value=5)
+        candidate_pool = st.slider("Candidate pool", min_value=10, max_value=50, value=20, step=5)
+
+        run_btn = st.button("Recommend Hashtags", type="primary")
+
+    with right:
+        st.subheader("Current Category Trends")
+        category_trend_df = trend_df.copy()
+        if len(category_trend_df) > 0:
+            st.dataframe(
+                category_trend_df[["tag", "trend_score"]].head(10),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No trend data available.")
+
+    if run_btn:
+        tags, rows = hybrid_rerank(
+            bundle=svm_bundle,
+            caption=caption,
+            category=category,
+            trend_score_dict=trend_score_dict,
+            category_affinity=category_affinity,
+            embedder=embedder_sem,
+            all_tags=all_tags_sem,
+            hashtag_embeddings=hashtag_embeddings_sem,
+            candidate_pool=candidate_pool,
+            top_k=top_k,
+        )
+
+        st.subheader("Final Recommended Hashtags")
+        st.code(" ".join(tags))
+
+        st.subheader("Scoring Breakdown")
+        st.dataframe(
+            pd.DataFrame(rows[:top_k])[[
+                "tag", "final_score", "base_score", "sem_score",
+                "trend_score", "cat_score", "lex_score", "penalty"
+            ]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        if sbert_lr_bundle is not None:
+            st.subheader("SBERT + LR Comparison")
+            sbert_tags = sbert_lr_predict(sbert_lr_bundle, caption, category, top_k=top_k)
+            st.write(sbert_tags)
+        else:
+            st.info("SBERT + LR comparison bundle not found in saved_models.")
+
+with tab2:
+    st.subheader("Qualitative Comparison")
+    selected_sample = st.selectbox(
+        "Choose demo sample",
+        options=list(range(len(SAMPLE_CAPTIONS))),
+        format_func=lambda i: f"{SAMPLE_CAPTIONS[i][1]} — {SAMPLE_CAPTIONS[i][0][:50]}..."
+    )
+
+    sample_caption, sample_category = SAMPLE_CAPTIONS[selected_sample]
+
+    hybrid_tags, _ = hybrid_rerank(
+        bundle=svm_bundle,
+        caption=sample_caption,
+        category=sample_category,
+        trend_score_dict=trend_score_dict,
+        category_affinity=category_affinity,
+        embedder=embedder_sem,
+        all_tags=all_tags_sem,
+        hashtag_embeddings=hashtag_embeddings_sem,
+        candidate_pool=20,
+        top_k=5,
+    )
+
+    compare_data = {
+        "Rank": [1, 2, 3, 4, 5],
+        "Hybrid_Final": hybrid_tags,
+    }
+
+    if sbert_lr_bundle is not None:
+        compare_data["SBERT_LR"] = sbert_lr_predict(
+            sbert_lr_bundle,
+            sample_caption,
+            sample_category,
+            top_k=5
+        )
+
+    st.markdown(f"**Caption:** {sample_caption}")
+    st.markdown(f"**Category:** {sample_category}")
+    st.dataframe(pd.DataFrame(compare_data), use_container_width=True, hide_index=True)
