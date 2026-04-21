@@ -39,18 +39,28 @@ RECENT_DAYS = 30
 OLDER_DAYS = 90
 TREND_MIN_FREQ = 3
 
+# Shared trend-aware weights
 TREND_W_BASE = 0.55
 TREND_W_TREND = 0.20
 TREND_W_CAT = 0.15
 TREND_W_LEX = 0.10
 TREND_GENERIC_PENALTY = 0.12
 
-HYBRID_W_BASE = 0.35
-HYBRID_W_SEM = 0.25
-HYBRID_W_TREND = 0.15
-HYBRID_W_CAT = 0.15
-HYBRID_W_LEX = 0.10
-HYBRID_GENERIC_PENALTY = 0.12
+# Final Model 1: TF-IDF semantic hybrid
+TFIDF_HYBRID_W_BASE = 0.40
+TFIDF_HYBRID_W_TREND = 0.20
+TFIDF_HYBRID_W_CAT = 0.10
+TFIDF_HYBRID_W_LEX = 0.10
+TFIDF_HYBRID_W_SEM = 0.20
+TFIDF_HYBRID_GENERIC_PENALTY = 0.12
+
+# Final Model 2: BERT semantic hybrid
+BERT_HYBRID_W_BASE = 0.35
+BERT_HYBRID_W_TREND = 0.15
+BERT_HYBRID_W_CAT = 0.15
+BERT_HYBRID_W_LEX = 0.10
+BERT_HYBRID_W_SEM = 0.25
+BERT_HYBRID_GENERIC_PENALTY = 0.12
 
 GENERIC_TAGS = {
     "#ad", "#love", "#instagood", "#photooftheday", "#photography",
@@ -243,8 +253,7 @@ def prepare_experiment_data(df: pd.DataFrame, use_category=True, top_n_hashtags=
 # =========================================================
 # MODEL TRAINING: SVM
 # =========================================================
-@st.cache_resource
-def run_caption_category_svm(_train_text, _y_train, _mlb):
+def run_caption_category_svm(train_text, y_train, mlb):
     tfidf = TfidfVectorizer(
         max_features=MAX_FEATURES_TFIDF,
         ngram_range=(1, 1),
@@ -253,18 +262,18 @@ def run_caption_category_svm(_train_text, _y_train, _mlb):
         max_df=MAX_DF,
     )
 
-    X_train = tfidf.fit_transform(_train_text)
+    X_train = tfidf.fit_transform(train_text)
 
     base = LinearSVC(C=SVM_C, dual=False, max_iter=3000, random_state=SEED)
     model = OneVsRestClassifier(base)
-    model.fit(X_train, _y_train)
+    model.fit(X_train, y_train)
 
     return {
         "name": "caption_category_svm",
         "display_name": "SVM",
         "model": model,
         "vectorizer": tfidf,
-        "mlb": _mlb,
+        "mlb": mlb,
         "use_category": True,
         "model_type": "sklearn",
     }
@@ -386,6 +395,30 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     return trend_df, trend_score_dict
 
 
+def build_hashtag_texts(train_df):
+    tag_texts = defaultdict(list)
+
+    for _, row in train_df.iterrows():
+        caption = str(row["clean_caption"]).strip().lower()
+        for tag in row["hashtags_list"]:
+            tag_texts[tag].append(caption)
+
+    return {tag: " ".join(texts) for tag, texts in tag_texts.items()}
+
+
+def build_tfidf_semantic_index(tfidf_vectorizer, train_df):
+    tag_docs = build_hashtag_texts(train_df)
+    tags = list(tag_docs.keys())
+    docs = list(tag_docs.values())
+    tag_vectors = tfidf_vectorizer.transform(docs)
+
+    return {
+        "tags": tags,
+        "tag_docs": tag_docs,
+        "tag_vectors": tag_vectors
+    }
+
+
 def build_hashtag_prototypes(train_df):
     hashtag_caption_tokens = defaultdict(Counter)
     hashtag_category_counts = defaultdict(Counter)
@@ -411,8 +444,8 @@ def build_hashtag_prototypes(train_df):
 
 
 @st.cache_resource
-def build_sbert_semantic_index(_train_df):
-    all_tags, prototypes = build_hashtag_prototypes(_train_df)
+def build_bert_semantic_index(train_df):
+    all_tags, prototypes = build_hashtag_prototypes(train_df)
     embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     hashtag_embeddings = embedder.encode(
         [prototypes[t] for t in all_tags],
@@ -455,6 +488,9 @@ def get_bundle_scores(bundle, caption: str, category: str):
     return scores
 
 
+# =========================================================
+# PIPELINES
+# =========================================================
 def raw_predict(bundle, caption: str, category: str, top_k=5, candidate_pool=20):
     scores = get_bundle_scores(bundle, caption, category)
 
@@ -530,9 +566,15 @@ def trend_aware_rerank(bundle, category_affinity, trend_score_dict, caption: str
     return [r["tag"] for r in rows[:top_k]], rows
 
 
-def compute_sbert_semantic_scores(caption: str, category: str, use_category: bool,
-                                  embedder, all_tags, hashtag_embeddings):
-    model_text = f"{str(category).strip().lower()} {str(caption).strip().lower()}" if use_category else str(caption).strip().lower()
+def compute_tfidf_semantic_scores(bundle, tfidf_semantic_index, caption: str, category: str):
+    model_text = get_model_text(bundle, caption, category)
+    query_vec = bundle["vectorizer"].transform([model_text])
+    sims = cosine_similarity(query_vec, tfidf_semantic_index["tag_vectors"])[0]
+    return {tag: float(sim) for tag, sim in zip(tfidf_semantic_index["tags"], sims)}
+
+
+def compute_bert_semantic_scores(bundle, embedder, all_tags, hashtag_embeddings, caption: str, category: str):
+    model_text = get_model_text(bundle, caption, category)
     query_emb = embedder.encode(
         [model_text],
         convert_to_numpy=True,
@@ -542,39 +584,32 @@ def compute_sbert_semantic_scores(caption: str, category: str, use_category: boo
     return {tag: float(sim) for tag, sim in zip(all_tags, sims)}
 
 
-def hybrid_rerank(bundle, category_affinity, trend_score_dict, caption: str, category: str,
-                  embedder, all_tags, hashtag_embeddings,
-                  candidate_pool=20, top_k=5):
+def tfidf_hybrid_rerank(bundle, category_affinity, trend_score_dict, tfidf_semantic_index,
+                        caption: str, category: str, candidate_pool=20, top_k=5):
     _, cand_scores = raw_predict(bundle, caption, category, top_k=top_k, candidate_pool=candidate_pool)
     cand_norm = minmax_normalize_dict(cand_scores)
 
-    sem_all = compute_sbert_semantic_scores(
-        caption=caption,
-        category=category,
-        use_category=bundle["use_category"],
-        embedder=embedder,
-        all_tags=all_tags,
-        hashtag_embeddings=hashtag_embeddings,
-    )
+    sem_all = compute_tfidf_semantic_scores(bundle, tfidf_semantic_index, caption, category)
     cand_sem = {tag: sem_all.get(tag, 0.0) for tag in cand_scores.keys()}
     cand_sem_norm = minmax_normalize_dict(cand_sem)
-    category = str(category).strip().lower()
 
+    category = str(category).strip().lower()
     rows = []
+
     for tag in cand_scores.keys():
         base_score = cand_norm.get(tag, 0.0)
         sem_score = cand_sem_norm.get(tag, 0.0)
         trend_score = float(trend_score_dict.get(tag, 0.0))
         cat_score = category_affinity.get(category, {}).get(tag, 0.0)
         lex_score = lexical_similarity(caption, tag)
-        penalty = HYBRID_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
+        penalty = TFIDF_HYBRID_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
 
         final_score = (
-            HYBRID_W_BASE * base_score +
-            HYBRID_W_SEM * sem_score +
-            HYBRID_W_TREND * trend_score +
-            HYBRID_W_CAT * cat_score +
-            HYBRID_W_LEX * lex_score -
+            TFIDF_HYBRID_W_BASE * base_score +
+            TFIDF_HYBRID_W_SEM * sem_score +
+            TFIDF_HYBRID_W_TREND * trend_score +
+            TFIDF_HYBRID_W_CAT * cat_score +
+            TFIDF_HYBRID_W_LEX * lex_score -
             penalty
         )
 
@@ -591,6 +626,51 @@ def hybrid_rerank(bundle, category_affinity, trend_score_dict, caption: str, cat
 
     rows = sorted(rows, key=lambda x: x["final_score"], reverse=True)
     return [r["tag"] for r in rows[:top_k]], rows
+
+
+def bert_hybrid_rerank(bundle, category_affinity, trend_score_dict, embedder, all_tags, hashtag_embeddings,
+                       caption: str, category: str, candidate_pool=20, top_k=5):
+    _, cand_scores = raw_predict(bundle, caption, category, top_k=top_k, candidate_pool=candidate_pool)
+    cand_norm = minmax_normalize_dict(cand_scores)
+
+    sem_all = compute_bert_semantic_scores(bundle, embedder, all_tags, hashtag_embeddings, caption, category)
+    cand_sem = {tag: sem_all.get(tag, 0.0) for tag in cand_scores.keys()}
+    cand_sem_norm = minmax_normalize_dict(cand_sem)
+
+    category = str(category).strip().lower()
+    rows = []
+
+    for tag in cand_scores.keys():
+        base_score = cand_norm.get(tag, 0.0)
+        sem_score = cand_sem_norm.get(tag, 0.0)
+        trend_score = float(trend_score_dict.get(tag, 0.0))
+        cat_score = category_affinity.get(category, {}).get(tag, 0.0)
+        lex_score = lexical_similarity(caption, tag)
+        penalty = BERT_HYBRID_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
+
+        final_score = (
+            BERT_HYBRID_W_BASE * base_score +
+            BERT_HYBRID_W_SEM * sem_score +
+            BERT_HYBRID_W_TREND * trend_score +
+            BERT_HYBRID_W_CAT * cat_score +
+            BERT_HYBRID_W_LEX * lex_score -
+            penalty
+        )
+
+        rows.append({
+            "tag": tag,
+            "final_score": float(final_score),
+            "base_score": float(base_score),
+            "sem_score": float(sem_score),
+            "trend_score": float(trend_score),
+            "cat_score": float(cat_score),
+            "lex_score": float(lex_score),
+            "penalty": float(penalty),
+        })
+
+    rows = sorted(rows, key=lambda x: x["final_score"], reverse=True)
+    return [r["tag"] for r in rows[:top_k]], rows
+
 
 # =========================================================
 # EVALUATION HELPERS
@@ -703,18 +783,36 @@ def get_trend_scores(bundle, category_affinity, trend_score_dict, df_split, top_
     return np.array(all_scores)
 
 
-def get_hybrid_scores(bundle, category_affinity, trend_score_dict, embedder, all_tags, hashtag_embeddings, df_split, top_k=5):
+def get_tfidf_hybrid_scores(bundle, category_affinity, trend_score_dict, tfidf_semantic_index, df_split, top_k=5):
     all_scores = []
     for _, row in df_split.iterrows():
-        tags, _ = hybrid_rerank(
+        tags, _ = tfidf_hybrid_rerank(
             bundle=bundle,
             category_affinity=category_affinity,
             trend_score_dict=trend_score_dict,
+            tfidf_semantic_index=tfidf_semantic_index,
             caption=row["clean_caption"],
             category=row["category"],
+            top_k=top_k
+        )
+        vec = tags_to_score_vector(tags, bundle["mlb"], full_length_score=True)
+        all_scores.append(vec)
+    return np.array(all_scores)
+
+
+def get_bert_hybrid_scores(bundle, category_affinity, trend_score_dict, embedder, all_tags, hashtag_embeddings,
+                           df_split, top_k=5):
+    all_scores = []
+    for _, row in df_split.iterrows():
+        tags, _ = bert_hybrid_rerank(
+            bundle=bundle,
+            category_affinity=category_affinity,
+            trend_score_dict=trend_score_dict,
             embedder=embedder,
             all_tags=all_tags,
             hashtag_embeddings=hashtag_embeddings,
+            caption=row["clean_caption"],
+            category=row["category"],
             top_k=top_k
         )
         vec = tags_to_score_vector(tags, bundle["mlb"], full_length_score=True)
@@ -753,14 +851,15 @@ def build_app_objects(csv_path: str):
     exp = prepare_experiment_data(df, use_category=True, top_n_hashtags=TOP_N_HASHTAGS)
 
     svm_bundle = run_caption_category_svm(
-        _train_text=exp["train_df"]["model_text"],
-        _y_train=exp["y_train"],
-        _mlb=exp["mlb"]
+        train_text=exp["train_df"]["model_text"],
+        y_train=exp["y_train"],
+        mlb=exp["mlb"]
     )
 
     category_affinity = build_category_affinity(exp["train_df"])
     trend_df, trend_score_dict = build_trend_score_table(exp["train_df"])
-    embedder_sem, all_tags_sem, hashtag_embeddings_sem = build_sbert_semantic_index(exp["train_df"])
+    tfidf_semantic_index = build_tfidf_semantic_index(svm_bundle["vectorizer"], exp["train_df"])
+    bert_embedder, bert_all_tags, bert_hashtag_embeddings = build_bert_semantic_index(exp["train_df"])
 
     try:
         sbert_lr_bundle = load_sbert_lr_bundle()
@@ -780,9 +879,10 @@ def build_app_objects(csv_path: str):
         "category_affinity": category_affinity,
         "trend_df": trend_df,
         "trend_score_dict": trend_score_dict,
-        "embedder_sem": embedder_sem,
-        "all_tags_sem": all_tags_sem,
-        "hashtag_embeddings_sem": hashtag_embeddings_sem,
+        "tfidf_semantic_index": tfidf_semantic_index,
+        "bert_embedder": bert_embedder,
+        "bert_all_tags": bert_all_tags,
+        "bert_hashtag_embeddings": bert_hashtag_embeddings,
     }
 
 
@@ -791,10 +891,15 @@ def build_app_objects(csv_path: str):
 # =========================================================
 def get_pipeline_options(system):
     options = [
-        "Final - SVM Hybrid",
-        "SVM Raw",
-        "SVM Lexical",
-        "SVM Trend-aware",
+        "Final Model 1 - SVM Raw",
+        "Final Model 1 - SVM Lexical",
+        "Final Model 1 - SVM Trend-aware",
+        "Final Model 1 - SVM Hybrid (TF-IDF Semantic)",
+
+        "Final Model 2 - SVM Raw",
+        "Final Model 2 - SVM Lexical",
+        "Final Model 2 - SVM Trend-aware",
+        "Final Model 2 - SVM Hybrid (BERT Semantic)",
     ]
 
     if "SBERT + LR" in system["models"]:
@@ -812,26 +917,12 @@ def run_selected_pipeline(system, pipeline_name, caption, category, top_k=5, can
     category_affinity = system["category_affinity"]
     trend_score_dict = system["trend_score_dict"]
 
-    if pipeline_name == "Final - SVM Hybrid":
-        return hybrid_rerank(
-            bundle=models["SVM"],
-            category_affinity=category_affinity,
-            trend_score_dict=trend_score_dict,
-            caption=caption,
-            category=category,
-            embedder=system["embedder_sem"],
-            all_tags=system["all_tags_sem"],
-            hashtag_embeddings=system["hashtag_embeddings_sem"],
-            candidate_pool=candidate_pool,
-            top_k=top_k
-        ), "hybrid"
-
-    if pipeline_name == "SVM Raw":
+    if pipeline_name == "Final Model 1 - SVM Raw":
         tags, scores = raw_predict(models["SVM"], caption, category, top_k, candidate_pool)
         rows = [{"tag": k, "base_score": v} for k, v in scores.items()]
         return (tags, rows), "raw"
 
-    if pipeline_name == "SVM Lexical":
+    if pipeline_name == "Final Model 1 - SVM Lexical":
         return lexical_rerank(
             bundle=models["SVM"],
             category_affinity=category_affinity,
@@ -841,7 +932,7 @@ def run_selected_pipeline(system, pipeline_name, caption, category, top_k=5, can
             top_k=top_k
         ), "lexical"
 
-    if pipeline_name == "SVM Trend-aware":
+    if pipeline_name == "Final Model 1 - SVM Trend-aware":
         return trend_aware_rerank(
             bundle=models["SVM"],
             category_affinity=category_affinity,
@@ -851,6 +942,58 @@ def run_selected_pipeline(system, pipeline_name, caption, category, top_k=5, can
             candidate_pool=candidate_pool,
             top_k=top_k
         ), "trend"
+
+    if pipeline_name == "Final Model 1 - SVM Hybrid (TF-IDF Semantic)":
+        return tfidf_hybrid_rerank(
+            bundle=models["SVM"],
+            category_affinity=category_affinity,
+            trend_score_dict=trend_score_dict,
+            tfidf_semantic_index=system["tfidf_semantic_index"],
+            caption=caption,
+            category=category,
+            candidate_pool=candidate_pool,
+            top_k=top_k
+        ), "hybrid_tfidf"
+
+    if pipeline_name == "Final Model 2 - SVM Raw":
+        tags, scores = raw_predict(models["SVM"], caption, category, top_k, candidate_pool)
+        rows = [{"tag": k, "base_score": v} for k, v in scores.items()]
+        return (tags, rows), "raw"
+
+    if pipeline_name == "Final Model 2 - SVM Lexical":
+        return lexical_rerank(
+            bundle=models["SVM"],
+            category_affinity=category_affinity,
+            caption=caption,
+            category=category,
+            candidate_pool=candidate_pool,
+            top_k=top_k
+        ), "lexical"
+
+    if pipeline_name == "Final Model 2 - SVM Trend-aware":
+        return trend_aware_rerank(
+            bundle=models["SVM"],
+            category_affinity=category_affinity,
+            trend_score_dict=trend_score_dict,
+            caption=caption,
+            category=category,
+            candidate_pool=candidate_pool,
+            top_k=top_k
+        ), "trend"
+
+    if pipeline_name == "Final Model 2 - SVM Hybrid (BERT Semantic)":
+        return bert_hybrid_rerank(
+            bundle=models["SVM"],
+            category_affinity=category_affinity,
+            trend_score_dict=trend_score_dict,
+            embedder=system["bert_embedder"],
+            all_tags=system["bert_all_tags"],
+            hashtag_embeddings=system["bert_hashtag_embeddings"],
+            caption=caption,
+            category=category,
+            candidate_pool=candidate_pool,
+            top_k=top_k
+        ), "hybrid_bert"
 
     if pipeline_name == "SBERT + LR Raw":
         tags, scores = raw_predict(models["SBERT + LR"], caption, category, top_k, candidate_pool)
@@ -889,74 +1032,94 @@ def run_demo_evaluation(system):
     models = system["models"]
 
     val_results = {
-        "svm_raw": evaluate_rank_metrics(exp["y_val"], get_raw_scores(models["SVM"], exp["val_df"])),
-        "svm_lexical": evaluate_rank_metrics(
+        "final1_svm_raw": evaluate_rank_metrics(exp["y_val"], get_raw_scores(models["SVM"], exp["val_df"])),
+        "final1_svm_lexical": evaluate_rank_metrics(
             exp["y_val"],
             get_lexical_scores(models["SVM"], system["category_affinity"], exp["val_df"])
         ),
-        "svm_trend": evaluate_rank_metrics(
+        "final1_svm_trend": evaluate_rank_metrics(
             exp["y_val"],
             get_trend_scores(models["SVM"], system["category_affinity"], system["trend_score_dict"], exp["val_df"])
         ),
-        "svm_hybrid": evaluate_rank_metrics(
+        "final1_svm_tfidf_hybrid": evaluate_rank_metrics(
             exp["y_val"],
-            get_hybrid_scores(
+            get_tfidf_hybrid_scores(
                 models["SVM"],
                 system["category_affinity"],
                 system["trend_score_dict"],
-                system["embedder_sem"],
-                system["all_tags_sem"],
-                system["hashtag_embeddings_sem"],
+                system["tfidf_semantic_index"],
+                exp["val_df"]
+            )
+        ),
+        "final2_svm_bert_hybrid": evaluate_rank_metrics(
+            exp["y_val"],
+            get_bert_hybrid_scores(
+                models["SVM"],
+                system["category_affinity"],
+                system["trend_score_dict"],
+                system["bert_embedder"],
+                system["bert_all_tags"],
+                system["bert_hashtag_embeddings"],
                 exp["val_df"]
             )
         ),
     }
 
     test_results = {
-        "svm_raw": evaluate_rank_metrics(exp["y_test"], get_raw_scores(models["SVM"], exp["test_df"])),
-        "svm_lexical": evaluate_rank_metrics(
+        "final1_svm_raw": evaluate_rank_metrics(exp["y_test"], get_raw_scores(models["SVM"], exp["test_df"])),
+        "final1_svm_lexical": evaluate_rank_metrics(
             exp["y_test"],
             get_lexical_scores(models["SVM"], system["category_affinity"], exp["test_df"])
         ),
-        "svm_trend": evaluate_rank_metrics(
+        "final1_svm_trend": evaluate_rank_metrics(
             exp["y_test"],
             get_trend_scores(models["SVM"], system["category_affinity"], system["trend_score_dict"], exp["test_df"])
         ),
-        "svm_hybrid": evaluate_rank_metrics(
+        "final1_svm_tfidf_hybrid": evaluate_rank_metrics(
             exp["y_test"],
-            get_hybrid_scores(
+            get_tfidf_hybrid_scores(
                 models["SVM"],
                 system["category_affinity"],
                 system["trend_score_dict"],
-                system["embedder_sem"],
-                system["all_tags_sem"],
-                system["hashtag_embeddings_sem"],
+                system["tfidf_semantic_index"],
+                exp["test_df"]
+            )
+        ),
+        "final2_svm_bert_hybrid": evaluate_rank_metrics(
+            exp["y_test"],
+            get_bert_hybrid_scores(
+                models["SVM"],
+                system["category_affinity"],
+                system["trend_score_dict"],
+                system["bert_embedder"],
+                system["bert_all_tags"],
+                system["bert_hashtag_embeddings"],
                 exp["test_df"]
             )
         ),
     }
 
     if "SBERT + LR" in models:
-        val_results["sbert_raw"] = evaluate_rank_metrics(
+        val_results["sbert_lr_raw"] = evaluate_rank_metrics(
             exp["y_val"], get_raw_scores(models["SBERT + LR"], exp["val_df"])
         )
-        val_results["sbert_lexical"] = evaluate_rank_metrics(
+        val_results["sbert_lr_lexical"] = evaluate_rank_metrics(
             exp["y_val"],
             get_lexical_scores(models["SBERT + LR"], system["category_affinity"], exp["val_df"])
         )
-        val_results["sbert_trend"] = evaluate_rank_metrics(
+        val_results["sbert_lr_trend"] = evaluate_rank_metrics(
             exp["y_val"],
             get_trend_scores(models["SBERT + LR"], system["category_affinity"], system["trend_score_dict"], exp["val_df"])
         )
 
-        test_results["sbert_raw"] = evaluate_rank_metrics(
+        test_results["sbert_lr_raw"] = evaluate_rank_metrics(
             exp["y_test"], get_raw_scores(models["SBERT + LR"], exp["test_df"])
         )
-        test_results["sbert_lexical"] = evaluate_rank_metrics(
+        test_results["sbert_lr_lexical"] = evaluate_rank_metrics(
             exp["y_test"],
             get_lexical_scores(models["SBERT + LR"], system["category_affinity"], exp["test_df"])
         )
-        test_results["sbert_trend"] = evaluate_rank_metrics(
+        test_results["sbert_lr_trend"] = evaluate_rank_metrics(
             exp["y_test"],
             get_trend_scores(models["SBERT + LR"], system["category_affinity"], system["trend_score_dict"], exp["test_df"])
         )
@@ -971,8 +1134,10 @@ def run_demo_evaluation(system):
 # =========================================================
 st.title("Hybrid Hashtag Recommendation Demo")
 st.caption(
-    "Final deployed model: SVM Hybrid. "
-    "SVM Raw / Lexical / Trend-aware and SBERT + LR variants are included for comparison."
+    "Final models: "
+    "Model 1 = SVM + TF-IDF semantic hybrid, "
+    "Model 2 = SVM + BERT semantic hybrid, "
+    "plus SBERT + LR comparison."
 )
 
 system = build_app_objects(str(DATA_PATH))
@@ -1050,21 +1215,31 @@ with tab1:
                 candidate_pool=candidate_pool,
                 top_k=top_k
             )
-            svm_hybrid_tags, svm_hybrid_rows = hybrid_rerank(
+            svm_tfidf_tags, _ = tfidf_hybrid_rerank(
                 bundle=system["models"]["SVM"],
                 category_affinity=system["category_affinity"],
                 trend_score_dict=system["trend_score_dict"],
+                tfidf_semantic_index=system["tfidf_semantic_index"],
                 caption=caption,
                 category=category,
-                embedder=system["embedder_sem"],
-                all_tags=system["all_tags_sem"],
-                hashtag_embeddings=system["hashtag_embeddings_sem"],
+                candidate_pool=candidate_pool,
+                top_k=top_k
+            )
+            svm_bert_tags, svm_bert_rows = bert_hybrid_rerank(
+                bundle=system["models"]["SVM"],
+                category_affinity=system["category_affinity"],
+                trend_score_dict=system["trend_score_dict"],
+                embedder=system["bert_embedder"],
+                all_tags=system["bert_all_tags"],
+                hashtag_embeddings=system["bert_hashtag_embeddings"],
+                caption=caption,
+                category=category,
                 candidate_pool=candidate_pool,
                 top_k=top_k
             )
 
             st.subheader("SVM Reference Output")
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
 
             with c1:
                 st.markdown("**SVM Raw**")
@@ -1082,12 +1257,25 @@ with tab1:
                     st.write(f"{i}. {tag}")
 
             with c4:
-                st.markdown("**SVM Hybrid**")
-                for i, tag in enumerate(svm_hybrid_tags, 1):
+                st.markdown("**SVM Hybrid (TF-IDF)**")
+                for i, tag in enumerate(svm_tfidf_tags, 1):
+                    st.write(f"{i}. {tag}")
+
+            with c5:
+                st.markdown("**SVM Hybrid (BERT)**")
+                for i, tag in enumerate(svm_bert_tags, 1):
                     st.write(f"{i}. {tag}")
 
             if "SBERT + LR" in system["models"]:
                 sbert_raw_tags, _ = raw_predict(system["models"]["SBERT + LR"], caption, category, top_k=top_k, candidate_pool=candidate_pool)
+                sbert_lex_tags, _ = lexical_rerank(
+                    bundle=system["models"]["SBERT + LR"],
+                    category_affinity=system["category_affinity"],
+                    caption=caption,
+                    category=category,
+                    candidate_pool=candidate_pool,
+                    top_k=top_k
+                )
                 sbert_trend_tags, _ = trend_aware_rerank(
                     bundle=system["models"]["SBERT + LR"],
                     category_affinity=system["category_affinity"],
@@ -1099,14 +1287,19 @@ with tab1:
                 )
 
                 st.subheader("SBERT + LR Reference Output")
-                c5, c6 = st.columns(2)
+                c6, c7, c8 = st.columns(3)
 
-                with c5:
+                with c6:
                     st.markdown("**SBERT + LR Raw**")
                     for i, tag in enumerate(sbert_raw_tags, 1):
                         st.write(f"{i}. {tag}")
 
-                with c6:
+                with c7:
+                    st.markdown("**SBERT + LR Lexical**")
+                    for i, tag in enumerate(sbert_lex_tags, 1):
+                        st.write(f"{i}. {tag}")
+
+                with c8:
                     st.markdown("**SBERT + LR Trend-aware**")
                     for i, tag in enumerate(sbert_trend_tags, 1):
                         st.write(f"{i}. {tag}")
@@ -1123,7 +1316,7 @@ with tab1:
                     hide_index=True
                 )
 
-            elif mode == "hybrid":
+            elif mode == "hybrid_tfidf" or mode == "hybrid_bert":
                 st.subheader("Hybrid Scoring Breakdown")
                 breakdown_df = pd.DataFrame(selected_rows[:top_k])
                 st.dataframe(
@@ -1181,15 +1374,24 @@ with tab2:
             category=sample_category,
             top_k=5
         )[0],
-        "SVM_HYBRID": hybrid_rerank(
+        "SVM_TFIDF_HYBRID": tfidf_hybrid_rerank(
             bundle=system["models"]["SVM"],
             category_affinity=system["category_affinity"],
             trend_score_dict=system["trend_score_dict"],
+            tfidf_semantic_index=system["tfidf_semantic_index"],
             caption=sample_caption,
             category=sample_category,
-            embedder=system["embedder_sem"],
-            all_tags=system["all_tags_sem"],
-            hashtag_embeddings=system["hashtag_embeddings_sem"],
+            top_k=5
+        )[0],
+        "SVM_BERT_HYBRID": bert_hybrid_rerank(
+            bundle=system["models"]["SVM"],
+            category_affinity=system["category_affinity"],
+            trend_score_dict=system["trend_score_dict"],
+            embedder=system["bert_embedder"],
+            all_tags=system["bert_all_tags"],
+            hashtag_embeddings=system["bert_hashtag_embeddings"],
+            caption=sample_caption,
+            category=sample_category,
             top_k=5
         )[0],
     }
@@ -1197,6 +1399,13 @@ with tab2:
     if "SBERT + LR" in system["models"]:
         compare_data["SBERT_RAW"] = raw_predict(
             system["models"]["SBERT + LR"], sample_caption, sample_category, top_k=5, candidate_pool=20
+        )[0]
+        compare_data["SBERT_LEXICAL"] = lexical_rerank(
+            bundle=system["models"]["SBERT + LR"],
+            category_affinity=system["category_affinity"],
+            caption=sample_caption,
+            category=sample_category,
+            top_k=5
         )[0]
         compare_data["SBERT_TREND"] = trend_aware_rerank(
             bundle=system["models"]["SBERT + LR"],
@@ -1222,6 +1431,6 @@ with tab3:
 
         st.markdown("**Suggested interpretation**")
         st.write(
-            "Use this table to show that the deployed model is SVM Hybrid, "
-            "while SVM Raw / Lexical / Trend-aware and SBERT + LR variants are comparison pipelines."
+            "Use this table to compare the two final SVM-based models "
+            "(TF-IDF semantic vs BERT semantic) against SBERT + LR."
         )
