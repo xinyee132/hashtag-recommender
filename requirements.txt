@@ -8,3 +8,4 @@ torch
 transformers
 gdown
 requests
+tensorflow
