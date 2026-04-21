@@ -8,7 +8,7 @@ from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 import streamlit as st
-import gdown
+import requests
 
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -164,9 +164,27 @@ def load_sbert_lr_bundle(export_dir=MODEL_DIR):
 def download_textcnn_weights():
     output_path = MODEL_DIR / "textcnn_glove.weights.h5"
 
-    if not output_path.exists():
-        url = f"https://drive.google.com/uc?id={TEXTCNN_GDRIVE_FILE_ID}"
-        gdown.download(url, str(output_path), quiet=False)
+    if output_path.exists():
+        return output_path
+
+    file_id = TEXTCNN_GDRIVE_FILE_ID
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    session = requests.Session()
+    response = session.get(url, stream=True)
+    response.raise_for_status()
+
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
+            response = session.get(url, stream=True)
+            response.raise_for_status()
+            break
+
+    with open(output_path, "wb") as f:
+        for chunk in response.iter_content(32768):
+            if chunk:
+                f.write(chunk)
 
     return output_path
 
