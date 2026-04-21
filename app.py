@@ -244,7 +244,7 @@ def prepare_experiment_data(df: pd.DataFrame, use_category=True, top_n_hashtags=
 # MODEL TRAINING: SVM
 # =========================================================
 @st.cache_resource
-def run_caption_category_svm(train_text, y_train, mlb):
+def run_caption_category_svm(_train_text, _y_train, _mlb):
     tfidf = TfidfVectorizer(
         max_features=MAX_FEATURES_TFIDF,
         ngram_range=(1, 1),
@@ -253,18 +253,18 @@ def run_caption_category_svm(train_text, y_train, mlb):
         max_df=MAX_DF,
     )
 
-    X_train = tfidf.fit_transform(train_text)
+    X_train = tfidf.fit_transform(_train_text)
 
     base = LinearSVC(C=SVM_C, dual=False, max_iter=3000, random_state=SEED)
     model = OneVsRestClassifier(base)
-    model.fit(X_train, y_train)
+    model.fit(X_train, _y_train)
 
     return {
         "name": "caption_category_svm",
         "display_name": "SVM",
         "model": model,
         "vectorizer": tfidf,
-        "mlb": mlb,
+        "mlb": _mlb,
         "use_category": True,
         "model_type": "sklearn",
     }
@@ -799,9 +799,9 @@ def build_app_objects(csv_path: str):
     exp = prepare_experiment_data(df, use_category=True, top_n_hashtags=TOP_N_HASHTAGS)
 
     svm_bundle = run_caption_category_svm(
-        train_text=exp["train_df"]["model_text"],
-        y_train=exp["y_train"],
-        mlb=exp["mlb"]
+        _train_text=exp["train_df"]["model_text"],
+        _y_train=exp["y_train"],
+        _mlb=exp["mlb"]
     )
 
     category_affinity = build_category_affinity(exp["train_df"])
