@@ -28,7 +28,7 @@ BASE_DIR = Path(".")
 DATA_PATH = BASE_DIR / "instagram_dataset_tfidf_ready.csv"
 MODEL_DIR = BASE_DIR / "saved_models"
 
-TOP_N_HASHTAGS = 50
+TOP_N_HASHTAGS = 100
 MAX_FEATURES_TFIDF = 2000
 MIN_DF = 10
 MAX_DF = 0.85
