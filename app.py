@@ -1045,14 +1045,14 @@ tab1, tab2, tab3 = st.tabs([
 
 # =========================================================
 # TAB 1: USER RECOMMENDATION
-# Clean user-facing interface
+# Compact one-page user-facing interface
 # =========================================================
 with tab1:
-    st.subheader("Generate Hashtag Recommendations")
-
-    left, right = st.columns([1.2, 1])
+    left, right = st.columns([1, 1])
 
     with left:
+        st.subheader("Input")
+
         default_idx = categories.index("fitness") if "fitness" in categories else 0
 
         category = st.selectbox(
@@ -1064,7 +1064,7 @@ with tab1:
         caption = st.text_area(
             "Caption",
             value="Having a great morning workout at the gym, feeling strong today!",
-            height=140
+            height=90
         )
 
         selected_family = st.selectbox(
@@ -1080,7 +1080,6 @@ with tab1:
             value=5
         )
 
-        # Fixed internally to avoid exposing technical tuning parameter
         candidate_pool = 20
 
         run_btn = st.button(
@@ -1089,37 +1088,30 @@ with tab1:
         )
 
     with right:
-        st.markdown("### How to use")
-        st.write(
-            "1. Select a category.\n\n"
-            "2. Enter a caption.\n\n"
-            "3. Choose a model family.\n\n"
-            "4. Click **Recommend Hashtags**."
-        )
+        st.subheader("Result")
 
-    if run_btn:
-        if not caption.strip():
-            st.warning("Please enter a caption.")
+        if run_btn:
+            if not caption.strip():
+                st.warning("Please enter a caption.")
+            else:
+                result = run_model_family(
+                    system=system,
+                    family_name=selected_family,
+                    caption=caption,
+                    category=category,
+                    top_k=top_k,
+                    candidate_pool=candidate_pool
+                )
+
+                st.markdown("### Final Hashtags")
+                st.code(" ".join(result["final_tags"]))
+
+                st.markdown("### Ranked Recommendations")
+
+                for i, tag in enumerate(result["final_tags"], 1):
+                    st.write(f"{i}. {tag}")
         else:
-            result = run_model_family(
-                system=system,
-                family_name=selected_family,
-                caption=caption,
-                category=category,
-                top_k=top_k,
-                candidate_pool=candidate_pool
-            )
-
-            st.divider()
-
-            st.subheader("Final Hashtags")
-
-            hashtag_text = " ".join(result["final_tags"])
-            st.code(hashtag_text)
-
-            st.markdown("### Ranked Recommendations")
-            for i, tag in enumerate(result["final_tags"], 1):
-                st.write(f"{i}. {tag}")
+            st.info("Enter a caption and click Recommend Hashtags.")
 
 
 # =========================================================
