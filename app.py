@@ -1038,20 +1038,21 @@ categories = sorted(system["exp"]["train_df"]["category"].dropna().unique().toli
 family_options = get_family_options(system)
 
 tab1, tab2, tab3 = st.tabs([
-    "Single Prediction",
-    "Qualitative Demo",
+    "User Recommendation",
+    "Model Explanation Demo",
     "Evaluation Demo"
 ])
 
 # =========================================================
-# TAB 1: SINGLE PREDICTION
+# TAB 1: USER RECOMMENDATION
+# Clean user-facing interface
 # =========================================================
 with tab1:
+    st.subheader("Generate Hashtag Recommendations")
+
     left, right = st.columns([1.2, 1])
 
     with left:
-        st.subheader("Input")
-
         default_idx = categories.index("fitness") if "fitness" in categories else 0
 
         category = st.selectbox(
@@ -1067,7 +1068,7 @@ with tab1:
         )
 
         selected_family = st.selectbox(
-            "Choose model family",
+            "Model family",
             family_options,
             index=0
         )
@@ -1079,7 +1080,7 @@ with tab1:
             value=5
         )
 
-        # Candidate pool is fixed internally to reduce user complexity
+        # Fixed internally to avoid exposing technical tuning parameter
         candidate_pool = 20
 
         run_btn = st.button(
@@ -1088,20 +1089,13 @@ with tab1:
         )
 
     with right:
-        st.subheader("Current Overall Trends")
-
-        trend_df = system["trend_df"]
-
-        if len(trend_df) > 0:
-            st.dataframe(
-                trend_df[
-                    ["tag", "recent_count", "velocity", "engagement_growth", "trend_score"]
-                ].head(10),
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.info("No trend data available.")
+        st.markdown("### How to use")
+        st.write(
+            "1. Select a category.\n\n"
+            "2. Enter a caption.\n\n"
+            "3. Choose a model family.\n\n"
+            "4. Click **Recommend Hashtags**."
+        )
 
     if run_btn:
         if not caption.strip():
@@ -1118,75 +1112,28 @@ with tab1:
 
             st.divider()
 
-            st.subheader("Recommended Hashtags")
+            st.subheader("Final Hashtags")
 
-            st.code(" ".join(result["final_tags"]))
+            hashtag_text = " ".join(result["final_tags"])
+            st.code(hashtag_text)
 
-            st.markdown("### Final Output")
-
+            st.markdown("### Ranked Recommendations")
             for i, tag in enumerate(result["final_tags"], 1):
                 st.write(f"{i}. {tag}")
 
-            with st.expander("Show model comparison details"):
-                cols = st.columns(4)
-
-                with cols[0]:
-                    st.markdown("**Raw**")
-                    for i, tag in enumerate(result["raw_tags"], 1):
-                        st.write(f"{i}. {tag}")
-
-                with cols[1]:
-                    st.markdown("**Lexical**")
-                    for i, tag in enumerate(result["lexical_tags"], 1):
-                        st.write(f"{i}. {tag}")
-
-                with cols[2]:
-                    st.markdown("**Trend-aware**")
-                    for i, tag in enumerate(result["trend_tags"], 1):
-                        st.write(f"{i}. {tag}")
-
-                with cols[3]:
-                    st.markdown(f"**{result['final_name']}**")
-                    for i, tag in enumerate(result["final_tags"], 1):
-                        st.write(f"{i}. {tag}")
-
-            with st.expander("Show scoring breakdown"):
-                breakdown_df = pd.DataFrame(result["final_rows"][:top_k])
-
-                if result["final_mode"] == "hybrid":
-                    display_cols = [
-                        "tag",
-                        "final_score",
-                        "base_score",
-                        "sem_score",
-                        "trend_score",
-                        "cat_score",
-                        "lex_score",
-                        "penalty"
-                    ]
-                else:
-                    display_cols = [
-                        "tag",
-                        "final_score",
-                        "base_score",
-                        "trend_score",
-                        "cat_score",
-                        "lex_score",
-                        "penalty"
-                    ]
-
-                st.dataframe(
-                    breakdown_df[display_cols],
-                    use_container_width=True,
-                    hide_index=True
-                )
-
 
 # =========================================================
-# TAB 2: QUALITATIVE DEMO
+# TAB 2: MODEL EXPLANATION DEMO
+# Technical explanation for presentation/demo
 # =========================================================
 with tab2:
-    st.subheader("Qualitative Comparison")
+    st.subheader("Model Explanation Demo")
+
+    st.caption(
+        "This section is intended for demonstration and explanation. "
+        "It shows how the raw model output is refined using lexical, trend-aware, "
+        "and hybrid reranking methods."
+    )
 
     selected_sample = st.selectbox(
         "Choose demo sample",
@@ -1196,8 +1143,85 @@ with tab2:
 
     sample_caption, sample_category = SAMPLE_CAPTIONS[selected_sample]
 
+    selected_family_demo = st.selectbox(
+        "Choose model family for explanation",
+        family_options,
+        index=0,
+        key="demo_model_family"
+    )
+
     st.markdown(f"**Caption:** {sample_caption}")
     st.markdown(f"**Category:** {sample_category}")
+
+    demo_result = run_model_family(
+        system=system,
+        family_name=selected_family_demo,
+        caption=sample_caption,
+        category=sample_category,
+        top_k=5,
+        candidate_pool=20
+    )
+
+    st.markdown("### Stage-by-Stage Output")
+
+    cols = st.columns(4)
+
+    with cols[0]:
+        st.markdown("**Raw Output**")
+        for i, tag in enumerate(demo_result["raw_tags"], 1):
+            st.write(f"{i}. {tag}")
+
+    with cols[1]:
+        st.markdown("**Lexical Rerank**")
+        for i, tag in enumerate(demo_result["lexical_tags"], 1):
+            st.write(f"{i}. {tag}")
+
+    with cols[2]:
+        st.markdown("**Trend-aware Rerank**")
+        for i, tag in enumerate(demo_result["trend_tags"], 1):
+            st.write(f"{i}. {tag}")
+
+    with cols[3]:
+        st.markdown(f"**Final Output ({demo_result['final_name']})**")
+        for i, tag in enumerate(demo_result["final_tags"], 1):
+            st.write(f"{i}. {tag}")
+
+    st.markdown("### Final Hashtags")
+    st.code(" ".join(demo_result["final_tags"]))
+
+    st.markdown("### Scoring Breakdown")
+
+    breakdown_df = pd.DataFrame(demo_result["final_rows"][:5])
+
+    if demo_result["final_mode"] == "hybrid":
+        display_cols = [
+            "tag",
+            "final_score",
+            "base_score",
+            "sem_score",
+            "trend_score",
+            "cat_score",
+            "lex_score",
+            "penalty"
+        ]
+    else:
+        display_cols = [
+            "tag",
+            "final_score",
+            "base_score",
+            "trend_score",
+            "cat_score",
+            "lex_score",
+            "penalty"
+        ]
+
+    st.dataframe(
+        breakdown_df[display_cols],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.markdown("### Qualitative Comparison Across Model Families")
 
     compare_data = {
         "Rank": [1, 2, 3, 4, 5],
@@ -1240,12 +1264,14 @@ with tab2:
 
 # =========================================================
 # TAB 3: EVALUATION DEMO
+# Metrics table
 # =========================================================
 with tab3:
     st.subheader("Evaluation Demo")
 
     st.caption(
-        "This table compares the final outputs of the deployed model families."
+        "This section compares the final deployed model families using ranking-based metrics "
+        "such as LRAP, Precision@K, MAP@5, and NDCG@5."
     )
 
     if st.button("Run Evaluation Table"):
@@ -1260,6 +1286,6 @@ with tab3:
 
         st.markdown("**Interpretation**")
         st.write(
-            "The evaluation compares Final Model 1, Final Model 2, and SBERT + LR "
-            "using ranking-based metrics such as LRAP, Precision@K, MAP@5, and NDCG@5."
+            "This table supports the model evaluation section by comparing the final outputs "
+            "of Final Model 1, Final Model 2, and SBERT + LR using ranking-based metrics."
         )
