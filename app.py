@@ -837,6 +837,7 @@ def build_app_objects(csv_path: str):
 # =========================================================
 def get_family_options(system):
     options = [
+        "Baseline - SVM + Trend Reranker",
         "Final Model 1 - SVM + TF-IDF Semantic",
         "Final Model 2 - SVM + BERT Semantic",
     ]
@@ -850,6 +851,27 @@ def get_family_options(system):
 def run_model_family(system, family_name, caption, category, top_k=5, candidate_pool=20):
     category_affinity = system["category_affinity"]
     trend_score_dict = system["trend_score_dict"]
+
+    if family_name == "Baseline - SVM + Trend Reranker":
+        bundle = system["models"]["SVM"]
+
+        raw_tags, raw_scores = raw_predict(bundle, caption, category, top_k=top_k, candidate_pool=candidate_pool)
+        lexical_tags, lexical_rows = lexical_rerank(bundle, category_affinity, caption, category, candidate_pool, top_k)
+        trend_tags, trend_rows = trend_aware_rerank(bundle, category_affinity, trend_score_dict, caption, category, candidate_pool, top_k)
+
+        return {
+            "family": family_name,
+            "final_name": "SVM + Trend Reranker",
+            "raw_tags": raw_tags,
+            "lexical_tags": lexical_tags,
+            "trend_tags": trend_tags,
+            "final_tags": trend_tags,
+            "lexical_rows": lexical_rows,
+            "trend_rows": trend_rows,
+            "final_rows": trend_rows,
+            "final_mode": "trend",
+            "raw_scores": raw_scores,
+        }
 
     if family_name == "Final Model 1 - SVM + TF-IDF Semantic":
         bundle = system["models"]["SVM"]
@@ -924,7 +946,7 @@ def run_model_family(system, family_name, caption, category, top_k=5, candidate_
 
         return {
             "family": family_name,
-            "final_name": "Trend-aware",
+            "final_name": "SBERT + LR Reranker",
             "raw_tags": raw_tags,
             "lexical_tags": lexical_tags,
             "trend_tags": trend_tags,
@@ -947,6 +969,15 @@ def run_demo_evaluation(system):
     models = system["models"]
 
     val_results = {
+        "baseline_svm_trend": evaluate_rank_metrics(
+            exp["y_val"],
+            get_trend_scores(
+                models["SVM"],
+                system["category_affinity"],
+                system["trend_score_dict"],
+                exp["val_df"]
+            )
+        ),
         "final1_svm_tfidf_hybrid": evaluate_rank_metrics(
             exp["y_val"],
             get_tfidf_hybrid_scores(
@@ -972,6 +1003,15 @@ def run_demo_evaluation(system):
     }
 
     test_results = {
+        "baseline_svm_trend": evaluate_rank_metrics(
+            exp["y_test"],
+            get_trend_scores(
+                models["SVM"],
+                system["category_affinity"],
+                system["trend_score_dict"],
+                exp["test_df"]
+            )
+        ),
         "final1_svm_tfidf_hybrid": evaluate_rank_metrics(
             exp["y_test"],
             get_tfidf_hybrid_scores(
@@ -1026,7 +1066,8 @@ def run_demo_evaluation(system):
 # =========================================================
 st.title("Hybrid Hashtag Recommendation Demo")
 st.caption(
-    "Three model families: "
+    "Available model families: "
+    "Baseline (SVM + Trend), "
     "Final Model 1 (SVM + TF-IDF semantic), "
     "Final Model 2 (SVM + BERT semantic), "
     "and SBERT + LR."
@@ -1147,6 +1188,7 @@ with tab2:
 
     compare_data = {
         "Rank": [1, 2, 3, 4, 5],
+        "Baseline (SVM + Trend)": run_model_family(system, "Baseline - SVM + Trend Reranker", sample_caption, sample_category, top_k=5)["final_tags"],
         "Final Model 1": run_model_family(system, "Final Model 1 - SVM + TF-IDF Semantic", sample_caption, sample_category, top_k=5)["final_tags"],
         "Final Model 2": run_model_family(system, "Final Model 2 - SVM + BERT Semantic", sample_caption, sample_category, top_k=5)["final_tags"],
     }
@@ -1159,7 +1201,7 @@ with tab2:
 
 with tab3:
     st.subheader("Evaluation Demo")
-    st.caption("This compares the final output of the 3 model families.")
+    st.caption("This compares the final output of the selected model families.")
 
     if st.button("Run Evaluation Table"):
         with st.spinner("Running evaluation..."):
@@ -1169,6 +1211,6 @@ with tab3:
 
         st.markdown("**Suggested interpretation**")
         st.write(
-            "Use this table to compare the final deployed outputs: "
-            "Final Model 1, Final Model 2, and SBERT + LR."
+            "Use this table to compare the baseline (SVM + Trend) against "
+            "the Semantic Hybrid versions and SBERT + LR."
         )
