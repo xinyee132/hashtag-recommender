@@ -19,7 +19,7 @@ st.set_page_config(page_title="Trend-Aware Hashtag Intelligence", layout="wide")
 # =========================================================
 # CONSTANTS & CONFIG (Synced exactly with Thesis & Eval Script)
 # =========================================================
-RERANK_W_BASE   = 0.50  # Semantic/Model backbone (SBERT)
+RERANK_W_BASE   = 0.50  # Semantic/Model backbone
 RERANK_W_TREND  = 0.20  # Engagement Intensity
 RERANK_W_CAT    = 0.15  # Historical Category Affinity
 RERANK_W_LEX    = 0.15  # Direct Caption Keyword Match
@@ -58,28 +58,41 @@ def calculate_lexical_sim(caption, tag):
     return 0.0
 
 # =========================================================
-# ACTUAL MODEL LOADER: SBERT + LR
+# MODEL LOADER (Handles both SBERT and TF-IDF SVM)
 # =========================================================
 @st.cache_resource
-def load_sbert_lr_bundle(export_dir=MODEL_DIR):
-    export_dir = Path(export_dir)
-    clf_path = export_dir / "sbert_lr_clf.joblib"
-    meta_path = export_dir / "sbert_lr_meta.pkl"
+def load_model_bundle(backbone_type="sbert"):
+    """
+    Loads the appropriate model and vectorizer based on selection.
+    Assumes files are named: sbert_lr_clf.joblib / tfidf_svm_clf.joblib
+    """
+    export_dir = MODEL_DIR
+    prefix = "sbert_lr" if backbone_type == "sbert" else "tfidf_svm"
+    
+    clf_path = export_dir / f"{prefix}_clf.joblib"
+    meta_path = export_dir / f"{prefix}_meta.pkl"
 
     if not clf_path.exists() or not meta_path.exists():
-        st.error(f"Model files not found in {export_dir}. Please ensure joblib and pkl files exist.")
-        st.stop()
+        st.warning(f"⚠️ Model files for {prefix} not found in {export_dir}. Please ensure they exist.")
+        return None
 
     clf = joblib.load(clf_path)
     with open(meta_path, "rb") as f:
         meta = pickle.load(f)
 
-    embedder = SentenceTransformer(meta["model_name"])
+    if backbone_type == "sbert":
+        vectorizer = SentenceTransformer(meta["model_name"])
+    else:
+        # TF-IDF vectorizer is typically saved inside the meta dict or loaded via joblib
+        vectorizer = meta.get("vectorizer", None)
+        if vectorizer is None:
+            st.error("TF-IDF Vectorizer not found in meta file.")
 
     return {
         "model": clf,
-        "vectorizer": embedder,
-        "mlb": meta["mlb"]
+        "vectorizer": vectorizer,
+        "mlb": meta["mlb"],
+        "type": backbone_type
     }
 
 # =========================================================
@@ -158,7 +171,6 @@ try:
     df = load_and_process_data(DATA_PATH)
     trend_df, trend_dict = build_trend_intelligence(df)
     cat_affinity = build_category_affinity(df)
-    bundle = load_sbert_lr_bundle(MODEL_DIR)
 except Exception as e:
     st.error(f"Initialization Error: {e}")
     st.stop()
@@ -177,11 +189,18 @@ with tab1:
         st.subheader("Post Details")
         category = st.selectbox("Category", sorted(df["category"].dropna().unique()))
         caption = st.text_area("Caption", placeholder="Enter your Instagram caption here...", height=120)
-        top_k = st.slider("Result Count", 3, 10, 5)
         
         st.subheader("System Architecture")
-        st.info("Active Backbone: SBERT + Logistic Regression")
-        st.caption("Reranker Weights: 50% Semantic (SBERT), 20% Trend, 15% Category, 15% Lexical")
+        # Added Backbone Model Selector
+        selected_backbone = st.radio(
+            "Select Backbone Model",
+            options=["SBERT + Logistic Regression", "TF-IDF + Linear SVM"],
+            index=0
+        )
+        top_k = st.slider("Result Count", 3, 10, 5)
+        
+        st.info("Hybrid Contextual Reranker Active")
+        st.caption("Reranker Weights: 50% Backbone, 20% Trend, 15% Category, 15% Lexical")
 
     with col_out:
         st.subheader("Recommendations")
@@ -189,17 +208,30 @@ with tab1:
             if not caption.strip():
                 st.warning("Please provide a caption.")
             else:
-                with st.spinner("Generating semantic embeddings..."):
-                    # 1. ACTUAL SBERT INFERENCE
-                    model_text = f"{str(category).lower()} {str(caption).lower()}"
-                    X_emb = bundle["vectorizer"].encode([model_text], convert_to_numpy=True, normalize_embeddings=True)
+                # Dynamically load the selected bundle
+                bundle_type = "sbert" if "SBERT" in selected_backbone else "tfidf"
+                bundle = load_model_bundle(bundle_type)
+                
+                if bundle is None:
+                    st.stop() # Stops execution if model files aren't found
                     
-                    if hasattr(bundle["model"], "predict_proba"):
-                        raw_scores = bundle["model"].predict_proba(X_emb)[0]
+                with st.spinner(f"Running inference with {selected_backbone}..."):
+                    
+                    # 1. ACTUAL MODEL INFERENCE (Handles Dense vs Sparse)
+                    model_text = f"{str(category).lower()} {str(caption).lower()}"
+                    
+                    if bundle["type"] == "sbert":
+                        X_emb = bundle["vectorizer"].encode([model_text], convert_to_numpy=True, normalize_embeddings=True)
+                        if hasattr(bundle["model"], "predict_proba"):
+                            raw_scores = bundle["model"].predict_proba(X_emb)[0]
+                        else:
+                            raw_scores = bundle["model"].decision_function(X_emb)[0]
                     else:
+                        # TF-IDF logic
+                        X_emb = bundle["vectorizer"].transform([model_text])
                         raw_scores = bundle["model"].decision_function(X_emb)[0]
 
-                    # 2. CANDIDATE GENERATION (Top 20 from SBERT)
+                    # 2. CANDIDATE GENERATION (Top 20 from Backbone)
                     candidate_pool = 20
                     top_indices = np.argsort(raw_scores)[::-1][:candidate_pool]
                     candidate_tags = [bundle["mlb"].classes_[i] for i in top_indices]
@@ -223,13 +255,14 @@ with tab1:
                         
                         results.append({
                             "Hashtag": tag,
-                            "Score": final_score,
-                            "SBERT": s_base,
+                            "Score": final_score, # THIS is what proves the reranker works
+                            "Backbone": s_base,
                             "Lexical": s_lex,
                             "Trend": s_trend,
                             "Category": s_cat
                         })
                     
+                    # Sorting by the FINAL SCORE generated by the Reranker
                     final_df = pd.DataFrame(results).sort_values("Score", ascending=False).head(top_k)
                     
                     st.success("Targeted Hashtags Generated:")
@@ -239,7 +272,7 @@ with tab1:
                     st.subheader("Explainability Breakdown")
                     # Formatted explainability string
                     final_df["Why?"] = final_df.apply(lambda x: 
-                        f"Semantics: {int(x['SBERT']*100)}% | Match: {int(x['Lexical']*100)}% | Trend: {int(x['Trend']*100)}% | Cat: {int(x['Category']*100)}%", axis=1)
+                        f"Base: {int(x['Backbone']*100)}% | Match: {int(x['Lexical']*100)}% | Trend: {int(x['Trend']*100)}% | Cat: {int(x['Category']*100)}%", axis=1)
                     st.table(final_df[["Hashtag", "Why?"]])
 
 with tab2:
