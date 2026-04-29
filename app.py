@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from sentence_transformers import SentenceTransformer
-from sklearn.preprocessing import MultiLabelBinarizer
 
 # =========================================================
 # PAGE CONFIG
@@ -35,7 +34,8 @@ DATA_PATH = Path("instagram_dataset_tfidf_ready.csv")
 def safe_parse(x):
     try:
         return ast.literal_eval(x) if isinstance(x, str) else []
-    except: return []
+    except: 
+        return []
 
 def tokenize(text):
     return re.sub(r"[^a-z0-9\s]", " ", str(text).lower()).split()
@@ -67,7 +67,7 @@ def load_model_bundle(backbone_type="sbert"):
     Assumes files are named: sbert_lr_clf.joblib / tfidf_svm_clf.joblib
     """
     export_dir = MODEL_DIR
-    prefix = "sbert_lr" if backbone_type == "sbert" else "tfidf_svm"
+    prefix = "sbert_lr" if backbone_type == "sbert" else "caption_category_svm"
     
     clf_path = export_dir / f"{prefix}_clf.joblib"
     meta_path = export_dir / f"{prefix}_meta.pkl"
@@ -83,7 +83,7 @@ def load_model_bundle(backbone_type="sbert"):
     if backbone_type == "sbert":
         vectorizer = SentenceTransformer(meta["model_name"])
     else:
-        # TF-IDF vectorizer is typically saved inside the meta dict or loaded via joblib
+        # TF-IDF vectorizer is saved inside the meta dict
         vectorizer = meta.get("vectorizer", None)
         if vectorizer is None:
             st.error("TF-IDF Vectorizer not found in meta file.")
@@ -191,7 +191,7 @@ with tab1:
         caption = st.text_area("Caption", placeholder="Enter your Instagram caption here...", height=120)
         
         st.subheader("System Architecture")
-        # Added Backbone Model Selector
+        # Backbone Model Selector
         selected_backbone = st.radio(
             "Select Backbone Model",
             options=["SBERT + Logistic Regression", "TF-IDF + Linear SVM"],
@@ -213,7 +213,7 @@ with tab1:
                 bundle = load_model_bundle(bundle_type)
                 
                 if bundle is None:
-                    st.stop() # Stops execution if model files aren't found
+                    st.stop() 
                     
                 with st.spinner(f"Running inference with {selected_backbone}..."):
                     
@@ -255,7 +255,7 @@ with tab1:
                         
                         results.append({
                             "Hashtag": tag,
-                            "Score": final_score, # THIS is what proves the reranker works
+                            "Score": final_score,
                             "Backbone": s_base,
                             "Lexical": s_lex,
                             "Trend": s_trend,
