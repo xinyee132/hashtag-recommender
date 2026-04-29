@@ -255,25 +255,27 @@ def prepare_trend_base_df(train_df):
     return df
 
 def generate_trend_explanation(row):
-    """Provides an explainable reason for why a hashtag is trending."""
-    reasons = []
-    if row["velocity_norm"] > 0.6:
-        reasons.append("📈 Surging Usage")
-    if row["engagement_growth_norm"] > 0.6:
-        reasons.append("🔥 High Engagement Rate")
-    if row["recency_norm"] > 0.6:
-        reasons.append("🕒 Recently Popular")
-        
-    if not reasons:
-        reasons.append("✅ Steady Performer")
-        
-    return " | ".join(reasons)
+    """Provides a human-readable, user-friendly explanation for why a hashtag is trending."""
+    vel = row["velocity"]
+    eng_growth = row["engagement_growth"]
+    recent_ct = row["recent_count"]
+
+    if vel >= 1.5 and eng_growth >= 1.2:
+        return "🔥 Viral & Engaging: Rapid usage spike with high audience interaction."
+    elif vel >= 1.5:
+        return "📈 Trending Up: Usage frequency is significantly higher than past months."
+    elif eng_growth >= 1.5:
+        return "💬 Conversation Starter: Generating unusually high likes and comments."
+    elif recent_ct >= 10: 
+        return "⭐ Consistent Staple: Highly reliable and frequently used."
+    else:
+        return "🌱 Emerging: Showing steady baseline traction."
 
 def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_DAYS, min_freq=TREND_MIN_FREQ):
     df = prepare_trend_base_df(train_df)
 
     if len(df) == 0:
-        return pd.DataFrame(columns=["tag", "trend_score"]), {}
+        return pd.DataFrame(columns=["tag", "domain", "trend_score", "trend_reason"]), {}
 
     max_time = df["timestamp"].max()
     recent_start = max_time - pd.Timedelta(days=recent_days)
@@ -287,10 +289,14 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     recent_eng_sum = defaultdict(float)
     older_eng_sum = defaultdict(float)
     recent_recency_sum = defaultdict(float)
+    
+    # Track which category each tag belongs to
+    tag_categories = defaultdict(Counter)
 
     for _, row in recent_df.iterrows():
         tags = row["hashtags_list"]
-        eng = float(row["engagement_rate"]) # Using new engagement rate
+        eng = float(row["engagement_rate"])
+        cat = str(row["category"]).strip().lower()
         age_days = max((max_time - row["timestamp"]).days, 0)
         recency_weight = 1 / (1 + age_days)
 
@@ -298,14 +304,17 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
             recent_counts[tag] += 1
             recent_eng_sum[tag] += eng
             recent_recency_sum[tag] += recency_weight
+            tag_categories[tag][cat] += 1
 
     for _, row in older_df.iterrows():
         tags = row["hashtags_list"]
-        eng = float(row["engagement_rate"]) # Using new engagement rate
+        eng = float(row["engagement_rate"])
+        cat = str(row["category"]).strip().lower()
 
         for tag in tags:
             older_counts[tag] += 1
             older_eng_sum[tag] += eng
+            tag_categories[tag][cat] += 1
 
     all_tags = set(recent_counts.keys()) | set(older_counts.keys())
     rows = []
@@ -323,9 +332,13 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
         velocity = (r_count + 1) / (o_count + 1)
         engagement_growth = (r_avg_eng + 1) / (o_avg_eng + 1)
         recency_score = recent_recency_sum.get(tag, 0.0)
+        
+        # Extract the Primary Domain for the tag
+        primary_domain = tag_categories[tag].most_common(1)[0][0] if tag_categories[tag] else "General"
 
         rows.append({
             "tag": tag,
+            "domain": primary_domain.title(),
             "recent_count": r_count,
             "older_count": o_count,
             "total_freq": total_freq,
@@ -339,7 +352,7 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     trend_df = pd.DataFrame(rows)
 
     if len(trend_df) == 0:
-        return pd.DataFrame(columns=["tag", "trend_score"]), {}
+        return pd.DataFrame(columns=["tag", "domain", "trend_score", "trend_reason"]), {}
 
     trend_df["velocity_norm"] = minmax_col(trend_df["velocity"])
     trend_df["engagement_growth_norm"] = minmax_col(trend_df["engagement_growth"])
@@ -698,20 +711,59 @@ with tab1:
             st.caption("The final score is a weighted combination of the base prediction, current social trends, category relevance, and exact keyword matches.")
             
             breakdown_df = pd.DataFrame(result["final_rows"][:top_k])
+            
+            # Safe rendering (No matplotlib dependency required)
             st.dataframe(
-                breakdown_df[["tag", "final_score", "base_score", "trend_score", "cat_score", "lex_score", "penalty"]].style.background_gradient(cmap="Blues", subset=["final_score"]),
+                breakdown_df[["tag", "final_score", "base_score", "trend_score", "cat_score", "lex_score", "penalty"]],
                 use_container_width=True,
                 hide_index=True
             )
 
 with tab2:
-    st.subheader("Current Social Media Trends")
-    st.markdown("Explore which hashtags are performing best right now based on recent velocity and engagement rates.")
+    st.subheader("📊 Social Media Trend Dashboard")
+    st.markdown("Discover which hashtags are gaining traction and why.")
     
     trend_df = system["trend_df"]
+    
     if len(trend_df) > 0:
+        # Domain Filter
+        all_domains = ["All Categories"] + sorted(trend_df["domain"].unique().tolist())
+        selected_domain = st.selectbox("Filter Trends by Category:", all_domains)
+        
+        if selected_domain != "All Categories":
+            display_df = trend_df[trend_df["domain"] == selected_domain].copy()
+        else:
+            display_df = trend_df.copy()
+
+        st.markdown(f"### Top Trending in {selected_domain}")
+        
+        # Display Top 3 in Metric Cards
+        top_3 = display_df.head(3)
+        cols = st.columns(3)
+        
+        for i, (_, row) in enumerate(top_3.iterrows()):
+            if i < 3:
+                with cols[i]:
+                    # Using Markdown to create a clean metric look
+                    st.markdown(f"## `#{row['tag']}`")
+                    st.markdown(f"**Domain:** {row['domain']}  \n**Score:** {row['trend_score']:.2f}")
+                    st.caption(f"_{row['trend_reason']}_")
+
+        st.divider()
+        st.markdown("#### Detailed Leaderboard")
+        
+        # Rename columns for the UI
+        clean_display_df = display_df.rename(columns={
+            "tag": "Hashtag",
+            "domain": "Primary Category",
+            "trend_score": "Trend Score",
+            "trend_reason": "Why is it trending?",
+            "recent_count": "Recent Uses"
+        })
+        
+        # Safe rendering (No matplotlib dependency required)
         st.dataframe(
-            trend_df[["tag", "trend_score", "trend_reason", "recent_count", "velocity", "engagement_growth"]].head(25),
+            clean_display_df[["Hashtag", "Primary Category", "Why is it trending?", "Trend Score", "Recent Uses"]].head(25),
             use_container_width=True,
             hide_index=True
         )
@@ -726,8 +778,8 @@ with tab3:
         with st.spinner("Running evaluation metrics on validation and test sets..."):
             results_df = run_demo_evaluation(system)
 
-        st.dataframe(results_df.style.highlight_max(axis=0, subset=['LRAP', 'P@5', 'R@5', 'Hit@5', 'MAP@5'], color='lightgreen'), 
-                     use_container_width=True, hide_index=True)
+        # Safe rendering (No matplotlib dependency required)
+        st.dataframe(results_df, use_container_width=True, hide_index=True)
         
         st.markdown("**Metrics Guide:**")
         st.markdown("- **LRAP**: Label Ranking Average Precision (Higher is better overall ranking).")
