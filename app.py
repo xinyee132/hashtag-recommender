@@ -36,7 +36,7 @@ SVM_C = 0.05
 SEED = 42
 
 RECENT_DAYS = 30
-OLDER_DAYS = 90
+OLDER_DAYS = 60  # Fixed: Compares Day 0-30 against Day 31-60
 TREND_MIN_FREQ = 3
 
 # Strictly matching the updated model parameters
@@ -468,7 +468,10 @@ st.divider()
 
 # --- SECTION 2: GLOBAL TRENDS ---
 st.subheader("🔥 Platform Trends Dashboard")
-st.caption(f"Filter and discover which topics gained traction over the last {RECENT_DAYS} days.")
+
+# Dynamically calculate the previous period length so the UI always matches your math
+PREVIOUS_PERIOD_DAYS = OLDER_DAYS - RECENT_DAYS
+st.caption(f"Filter and discover which topics are gaining traction. Metrics compare the **last {RECENT_DAYS} days** against the **previous {PREVIOUS_PERIOD_DAYS} days**.")
 
 trend_df = system["trend_df"]
 
@@ -525,12 +528,12 @@ if len(trend_df) > 0:
             "Primary Category": st.column_config.TextColumn("Category"),
             "Velocity": st.column_config.NumberColumn(
                 "Velocity", 
-                help="Percentage change in usage speed compared to the previous period.",
+                help=f"Percentage change in usage speed compared to the previous {PREVIOUS_PERIOD_DAYS} days.",
                 format="%+d%%"  # Automatically formats as +5% or -20%
             ),
             "Engagement": st.column_config.NumberColumn(
                 "Eng. Growth", 
-                help="Percentage change in audience engagement (likes/comments).",
+                help=f"Percentage change in audience engagement (likes/comments) compared to the previous {PREVIOUS_PERIOD_DAYS} days.",
                 format="%+d%%"
             ),
             "Trend Index": st.column_config.ProgressColumn(
