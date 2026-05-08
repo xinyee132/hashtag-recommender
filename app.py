@@ -471,7 +471,16 @@ st.subheader("🔥 Platform Trends Dashboard")
 
 # Dynamically calculate the previous period length so the UI always matches your math
 PREVIOUS_PERIOD_DAYS = OLDER_DAYS - RECENT_DAYS
+
 st.caption(f"Filter and discover which topics are gaining traction. Metrics compare the **last {RECENT_DAYS} days** against the **previous {PREVIOUS_PERIOD_DAYS} days**.")
+
+# Cheat Sheet for users to understand metrics
+with st.expander("ℹ️ How to read these metrics"):
+    st.markdown("""
+    * **Velocity:** How fast is this hashtag growing? A positive percentage means it is being used more often this period than the previous period.
+    * **Eng. Growth:** Are audiences interacting with this topic? A positive percentage means posts with this hashtag are getting more likes and comments than they used to.
+    * **Trend Index (0-100):** Our overall score. It combines Velocity, Engagement, and Recency (how close to today the hashtag was used) into one simple score.
+    """)
 
 trend_df = system["trend_df"]
 
@@ -527,12 +536,12 @@ if len(trend_df) > 0:
             "Hashtag": st.column_config.TextColumn("Trending Hashtag", width="medium"),
             "Primary Category": st.column_config.TextColumn("Category"),
             "Velocity": st.column_config.NumberColumn(
-                "Velocity", 
+                f"Velocity (vs Prior {PREVIOUS_PERIOD_DAYS} Days)", 
                 help=f"Percentage change in usage speed compared to the previous {PREVIOUS_PERIOD_DAYS} days.",
                 format="%+d%%"  # Automatically formats as +5% or -20%
             ),
             "Engagement": st.column_config.NumberColumn(
-                "Eng. Growth", 
+                f"Eng. Growth (vs Prior {PREVIOUS_PERIOD_DAYS} Days)", 
                 help=f"Percentage change in audience engagement (likes/comments) compared to the previous {PREVIOUS_PERIOD_DAYS} days.",
                 format="%+d%%"
             ),
