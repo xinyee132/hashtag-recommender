@@ -19,7 +19,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================================================
 # PAGE CONFIG
 # =========================================================
-st.set_page_config(page_title="Caption-Driven Hashtag Recommender", layout="wide")
+st.set_page_config(page_title="Hashtag Recommender", layout="wide")
 
 # =========================================================
 # CONFIG
@@ -81,30 +81,17 @@ def get_model_text(bundle, caption: str, category: str):
     caption = str(caption).strip().lower()
     return f"{category} {caption}" if bundle.get("use_category", False) else caption
 
-# =========================================================
-# UI TEXT TRANSLATORS
-# =========================================================
-def get_match_label(score):
-    if score > 0.15: return "🎯 Highly Relevant"
-    elif score > 0.05: return "🔍 Good Context"
-    else: return "💡 Broad Topic"
-
-def get_trend_label(score):
-    if score > 0.5: return "🔥 Hot Trend"
-    elif score > 0.2: return "📈 Rising"
-    else: return "➖ Steady"
-
 def generate_trend_explanation(row):
     vel = row["velocity"]
     eng_growth = row["engagement_growth"]
     recent_ct = row["recent_count"]
 
     if vel >= 1.5 and eng_growth >= 1.2:
-        return "🔥 Viral: Rapid usage spike with high audience interaction."
+        return "🔥 Viral: Rapid usage spike with high interaction."
     elif vel >= 1.5:
         return "📈 Trending Up: Being used significantly more than past months."
     elif eng_growth >= 1.5:
-        return "💬 Conversation Starter: Generating unusually high likes and comments."
+        return "💬 Conversation Starter: Generating high likes and comments."
     elif recent_ct >= 10: 
         return "⭐ Consistent Staple: Highly reliable and frequently used."
     else:
@@ -170,7 +157,6 @@ def prepare_experiment_data(df: pd.DataFrame, top_n_hashtags=TOP_N_HASHTAGS):
     work_df["hashtags_list"] = work_df["hashtags_list"].apply(lambda tags: [t for t in tags if t in top_tags])
     work_df = work_df[work_df["hashtags_list"].map(len) > 0].reset_index(drop=True)
     
-    # Base models will use the category + caption
     work_df["model_text"] = work_df["category"] + " " + work_df["clean_caption"]
 
     mlb = MultiLabelBinarizer()
@@ -188,11 +174,7 @@ def prepare_experiment_data(df: pd.DataFrame, top_n_hashtags=TOP_N_HASHTAGS):
 
     return {
         "train_df": train_df.reset_index(drop=True),
-        "val_df": val_df.reset_index(drop=True),
-        "test_df": test_df.reset_index(drop=True),
         "y_train": y_train,
-        "y_val": y_val,
-        "y_test": y_test,
         "mlb": mlb,
         "use_category": True,
     }
@@ -314,11 +296,10 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
         0.20 * trend_df["recency_norm"]
     )
     
-    # Generate user-friendly explanations
     trend_df["trend_reason"] = trend_df.apply(generate_trend_explanation, axis=1)
-
     trend_df = trend_df.sort_values("trend_score", ascending=False).reset_index(drop=True)
     trend_score_dict = dict(zip(trend_df["tag"], trend_df["trend_score"]))
+    
     return trend_df, trend_score_dict
 
 # =========================================================
@@ -339,7 +320,6 @@ def get_bundle_scores(bundle, caption: str, category: str):
     return scores
 
 def compute_semantic_cos_score(bundle, caption: str, tag: str):
-    """Computes pure text-based semantic cosine similarity."""
     if not caption.strip():
         return 0.0
     
@@ -379,15 +359,11 @@ def strict_rerank_pipeline(bundle, trend_score_dict, caption: str, category: str
 
         rows.append({
             "tag": tag,
-            "final_score": float(final_score),
-            "base_score": float(base_score),
-            "cos_score": float(cos_score),
-            "trend_score": float(trend_score),
-            "penalty": float(penalty),
+            "final_score": float(final_score)
         })
 
     rows = sorted(rows, key=lambda x: x["final_score"], reverse=True)
-    return [r["tag"] for r in rows[:top_k]], rows
+    return [r["tag"] for r in rows[:top_k]]
 
 # =========================================================
 # APP BUILDER & RUNNER
@@ -415,7 +391,6 @@ def build_app_objects(csv_path: str):
         models["SBERT + LR"] = sbert_lr_bundle
 
     return {
-        "df": df,
         "exp": exp,
         "models": models,
         "trend_df": trend_df,
@@ -432,18 +407,13 @@ def run_model_family(system, family_name, caption, category, top_k=5, candidate_
     else:
         raise ValueError(f"Unknown family: {family_name}")
 
-    final_tags, final_rows = strict_rerank_pipeline(bundle, trend_score_dict, caption, category, candidate_pool, top_k)
-
-    return {
-        "final_tags": final_tags,
-        "final_rows": final_rows,
-    }
+    final_tags = strict_rerank_pipeline(bundle, trend_score_dict, caption, category, candidate_pool, top_k)
+    return final_tags
 
 # =========================================================
 # UI
 # =========================================================
-st.title("Hashtag Recommender & Trend Explorer")
-st.caption("Generate highly relevant hashtags based on what you are posting and what is currently trending.")
+st.title("Hashtag Recommender & Trends")
 
 system = build_app_objects(str(DATA_PATH))
 categories = sorted(system["exp"]["train_df"]["category"].dropna().unique().tolist())
@@ -452,75 +422,59 @@ family_options = ["SVM (Base)"]
 if "SBERT + LR" in system["models"]:
     family_options.append("SBERT + LR")
 
-tab1, tab2 = st.tabs(["Hashtag Recommender", "Trend Leaderboard"])
+# --- SECTION 1: HASHTAG GENERATOR ---
+st.subheader("✍️ Draft Your Post")
 
-with tab1:
-    st.subheader("Generate Hashtags")
-    
-    col_cat, col_fam = st.columns([1, 1])
-    with col_cat:
-        default_idx = categories.index("fitness") if "fitness" in categories else 0
-        category = st.selectbox("Select Post Category", categories, index=default_idx)
-    with col_fam:
-        selected_family = st.selectbox("Select Intelligence Model", family_options, index=0)
-    
-    caption = st.text_area("Post Caption", value="Having a great morning workout at the gym, feeling strong today!", height=100)
-    
-    # Moved technical sliders to an expander so they don't clutter the UI for regular users
-    with st.expander("⚙️ Advanced Settings"):
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            top_k = st.slider("Number of Hashtags to Output", min_value=3, max_value=15, value=5)
-        with col2:
-            candidate_pool = st.slider("Internal Search Space", min_value=10, max_value=100, value=50, step=5)
+col_cat, col_fam = st.columns([1, 1])
+with col_cat:
+    default_idx = categories.index("fitness") if "fitness" in categories else 0
+    category = st.selectbox("Select Post Category", categories, index=default_idx)
+with col_fam:
+    selected_family = st.selectbox("Select Intelligence Model", family_options, index=0)
 
-    run_btn = st.button("Generate Recommendations", type="primary", use_container_width=True)
+caption = st.text_area("Post Caption", value="Having a great morning workout at the gym, feeling strong today!", height=100)
 
-    if run_btn:
-        if not caption.strip():
-            st.warning("Please enter a caption.")
-        else:
-            with st.spinner("Analyzing semantics and current trends..."):
-                result = run_model_family(system, selected_family, caption, category, top_k, candidate_pool)
+with st.expander("⚙️ Advanced Settings"):
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        top_k = st.slider("Number of Hashtags to Output", min_value=3, max_value=15, value=5)
+    with col2:
+        candidate_pool = st.slider("Internal Search Space", min_value=10, max_value=100, value=50, step=5)
 
-            st.success("Recommendations Generated!")
-            st.subheader("Recommended Hashtags")
-            st.code(" ".join([f"#{t}" for t in result["final_tags"]]), language="markdown")
-            
-            st.divider()
-            st.markdown("### Why did we choose these?")
-            
-            breakdown_df = pd.DataFrame(result["final_rows"][:top_k])
-            
-            # Translate raw scores to human-readable UI columns
-            display_df = pd.DataFrame()
-            display_df["Hashtag"] = breakdown_df["tag"].apply(lambda x: f"#{x}")
-            display_df["Caption Relevance"] = breakdown_df["cos_score"].apply(get_match_label)
-            display_df["Trend Status"] = breakdown_df["trend_score"].apply(get_trend_label)
-            
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True
-            )
+run_btn = st.button("Generate Recommendations", type="primary", use_container_width=True)
 
-with tab2:
-    st.subheader("📊 Hashtag Trend Leaderboard")
-    st.caption("Discover which topics are gaining traction across the platform right now.")
-    
-    trend_df = system["trend_df"]
-    
-    if len(trend_df) > 0:
-        # Create a clean, user-friendly display dataframe
-        clean_trend_df = pd.DataFrame()
-        clean_trend_df["Trending Hashtag"] = trend_df["tag"].apply(lambda x: f"#{x}")
-        clean_trend_df["Why is it trending?"] = trend_df["trend_reason"]
-        clean_trend_df["Recent Usage Count"] = trend_df["recent_count"].astype(int)
-        
-        st.dataframe(
-            clean_trend_df.head(50),
-            use_container_width=True,
-            hide_index=True
-        )
+if run_btn:
+    if not caption.strip():
+        st.warning("Please enter a caption.")
     else:
-        st.info("No trend data available. Make sure your dataset includes timestamps and engagement metrics.")
+        with st.spinner("Analyzing semantics and current trends..."):
+            final_tags = run_model_family(system, selected_family, caption, category, top_k, candidate_pool)
+
+        st.success("Recommendations Generated!")
+        
+        # Cleanly format the tags ensuring no double ##
+        clean_tags = [f"#{str(t).replace('#', '')}" for t in final_tags]
+        st.code(" ".join(clean_tags), language="markdown")
+
+st.divider()
+
+# --- SECTION 2: GLOBAL TRENDS ---
+st.subheader("🔥 Current Platform Trends")
+st.caption("Discover which topics are gaining traction across the platform right now.")
+
+trend_df = system["trend_df"]
+
+if len(trend_df) > 0:
+    clean_trend_df = pd.DataFrame()
+    # Strip any existing # to prevent ## bugs
+    clean_trend_df["Trending Hashtag"] = trend_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
+    clean_trend_df["Why is it trending?"] = trend_df["trend_reason"]
+    clean_trend_df["Recent Uses"] = trend_df["recent_count"].astype(int)
+    
+    st.dataframe(
+        clean_trend_df.head(50),
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.info("No trend data available. Make sure your dataset includes timestamps and engagement metrics.")
