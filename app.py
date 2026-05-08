@@ -465,16 +465,62 @@ st.caption("Discover which topics are gaining traction across the platform right
 trend_df = system["trend_df"]
 
 if len(trend_df) > 0:
-    clean_trend_df = pd.DataFrame()
-    # Strip any existing # to prevent ## bugs
-    clean_trend_df["Trending Hashtag"] = trend_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
-    clean_trend_df["Why is it trending?"] = trend_df["trend_reason"]
-    clean_trend_df["Recent Uses"] = trend_df["recent_count"].astype(int)
+    # --- UPGRADE 1: Top 3 Highlight Cards ---
+    st.markdown("##### 🏆 Top Trending Right Now")
+    top_3 = trend_df.head(3)
+    cols = st.columns(3)
     
+    for i, (_, row) in enumerate(top_3.iterrows()):
+        with cols[i]:
+            # Clean the tag
+            tag_name = f"#{str(row['tag']).replace('#', '')}"
+            # Extract just the short label (e.g., "🔥 Viral" or "📈 Trending Up")
+            short_reason = row['trend_reason'].split(':')[0] 
+            uses = int(row['recent_count'])
+            
+            # Use Streamlit's native metric card for a clean, analytical look
+            st.metric(
+                label=short_reason, 
+                value=tag_name, 
+                delta=f"{uses} recent uses", 
+                delta_color="normal"
+            )
+
+    st.divider()
+
+    # --- UPGRADE 2: Analytical Leaderboard ---
+    st.markdown("##### 📊 Full Trend Leaderboard")
+    
+    clean_trend_df = pd.DataFrame()
+    clean_trend_df["Trending Hashtag"] = trend_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
+    clean_trend_df["Trend Analysis"] = trend_df["trend_reason"]
+    clean_trend_df["Volume"] = trend_df["recent_count"].astype(int)
+    
+    # Get the maximum volume to scale our progress bars
+    max_volume = int(clean_trend_df["Volume"].max()) if not clean_trend_df.empty else 10
+
+    # Display the dataframe with advanced column configuration
     st.dataframe(
         clean_trend_df.head(50),
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        column_config={
+            "Trending Hashtag": st.column_config.TextColumn(
+                "Hashtag", 
+                width="medium"
+            ),
+            "Trend Analysis": st.column_config.TextColumn(
+                "Why is it trending?", 
+                width="large"
+            ),
+            "Volume": st.column_config.ProgressColumn(
+                "Recent Volume",
+                help="Visual indicator of recent usage volume relative to the top trend.",
+                format="%d uses",
+                min_value=0,
+                max_value=max_volume,
+            ),
+        }
     )
 else:
     st.info("No trend data available. Make sure your dataset includes timestamps and engagement metrics.")
