@@ -81,21 +81,22 @@ def get_model_text(bundle, caption: str, category: str):
     caption = str(caption).strip().lower()
     return f"{category} {caption}" if bundle.get("use_category", False) else caption
 
+# Make trend explanations punchy and analytical for the UI
 def generate_trend_explanation(row):
     vel = row["velocity"]
     eng_growth = row["engagement_growth"]
     recent_ct = row["recent_count"]
 
     if vel >= 1.5 and eng_growth >= 1.2:
-        return "🔥 Viral: Rapid usage spike with high interaction."
+        return "🔥 Viral Spike"
     elif vel >= 1.5:
-        return "📈 Trending Up: Being used significantly more than past months."
+        return "📈 Gaining Momentum"
     elif eng_growth >= 1.5:
-        return "💬 Conversation Starter: Generating high likes and comments."
+        return "💬 High Engagement"
     elif recent_ct >= 10: 
-        return "⭐ Consistent Staple: Highly reliable and frequently used."
+        return "⭐ Established Staple"
     else:
-        return "🌱 Emerging: Showing steady baseline traction."
+        return "🌱 Steady Baseline"
 
 # =========================================================
 # OPTIONAL MODEL LOADER: SBERT + LR
@@ -133,7 +134,7 @@ def load_dataset(csv_path: str):
     df = pd.read_csv(csv_path)
     df["hashtags_list"] = df["hashtags_list"].apply(safe_parse)
     df["clean_caption"] = df["clean_caption"].fillna("")
-    df["category"] = df["category"].fillna("unknown").astype(str).str.lower().str.strip()
+    df["category"] = df["category"].fillna("unknown").astype(str).str.title().str.strip() # Clean formatting
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -157,7 +158,7 @@ def prepare_experiment_data(df: pd.DataFrame, top_n_hashtags=TOP_N_HASHTAGS):
     work_df["hashtags_list"] = work_df["hashtags_list"].apply(lambda tags: [t for t in tags if t in top_tags])
     work_df = work_df[work_df["hashtags_list"].map(len) > 0].reset_index(drop=True)
     
-    work_df["model_text"] = work_df["category"] + " " + work_df["clean_caption"]
+    work_df["model_text"] = work_df["category"].str.lower() + " " + work_df["clean_caption"]
 
     mlb = MultiLabelBinarizer()
     y = mlb.fit_transform(work_df["hashtags_list"])
@@ -207,13 +208,12 @@ def run_caption_svm(_train_text, _y_train, _mlb):
     }
 
 # =========================================================
-# TREND SCORING
+# TREND SCORING & CATEGORY TRACKING
 # =========================================================
 def prepare_trend_base_df(train_df):
     df = train_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"]).copy()
-    
     df["engagement_rate"] = (df["likes"].fillna(0) + df["comment_count"].fillna(0)) / (df["followers"].fillna(0) + 1)
     return df
 
@@ -235,25 +235,32 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     recent_eng_sum = defaultdict(float)
     older_eng_sum = defaultdict(float)
     recent_recency_sum = defaultdict(float)
+    
+    # Track categories for each hashtag
+    tag_categories = defaultdict(Counter)
 
     for _, row in recent_df.iterrows():
         tags = row["hashtags_list"]
         eng = float(row["engagement_rate"])
         age_days = max((max_time - row["timestamp"]).days, 0)
         recency_weight = 1 / (1 + age_days)
+        cat = str(row["category"])
 
         for tag in tags:
             recent_counts[tag] += 1
             recent_eng_sum[tag] += eng
             recent_recency_sum[tag] += recency_weight
+            tag_categories[tag][cat] += 1
 
     for _, row in older_df.iterrows():
         tags = row["hashtags_list"]
         eng = float(row["engagement_rate"])
+        cat = str(row["category"])
 
         for tag in tags:
             older_counts[tag] += 1
             older_eng_sum[tag] += eng
+            tag_categories[tag][cat] += 1
 
     all_tags = set(recent_counts.keys()) | set(older_counts.keys())
     rows = []
@@ -271,9 +278,13 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
         velocity = (r_count + 1) / (o_count + 1)
         engagement_growth = (r_avg_eng + 1) / (o_avg_eng + 1)
         recency_score = recent_recency_sum.get(tag, 0.0)
+        
+        # Determine the primary category for the filter
+        primary_domain = tag_categories[tag].most_common(1)[0][0] if tag_categories[tag] else "General"
 
         rows.append({
             "tag": tag,
+            "category": primary_domain,
             "recent_count": r_count,
             "older_count": o_count,
             "velocity": velocity,
@@ -427,7 +438,7 @@ st.subheader("✍️ Draft Your Post")
 
 col_cat, col_fam = st.columns([1, 1])
 with col_cat:
-    default_idx = categories.index("fitness") if "fitness" in categories else 0
+    default_idx = categories.index("Fitness") if "Fitness" in categories else 0
     category = st.selectbox("Select Post Category", categories, index=default_idx)
 with col_fam:
     selected_family = st.selectbox("Select Intelligence Model", family_options, index=0)
@@ -459,63 +470,56 @@ if run_btn:
 st.divider()
 
 # --- SECTION 2: GLOBAL TRENDS ---
-st.subheader("🔥 Current Platform Trends")
-st.caption("Discover which topics are gaining traction across the platform right now.")
+st.subheader("🔥 Platform Trends Dashboard")
+st.caption("Filter and discover which topics are gaining traction across the platform right now.")
 
 trend_df = system["trend_df"]
 
 if len(trend_df) > 0:
-    # --- UPGRADE 1: Top 3 Highlight Cards ---
-    st.markdown("##### 🏆 Top Trending Right Now")
-    top_3 = trend_df.head(3)
+    # --- Category Filter ---
+    all_trend_cats = ["All Categories"] + sorted(trend_df["category"].dropna().unique().tolist())
+    selected_trend_cat = st.selectbox("Filter leaderboard by category:", all_trend_cats)
+    
+    if selected_trend_cat != "All Categories":
+        display_df = trend_df[trend_df["category"] == selected_trend_cat].copy()
+    else:
+        display_df = trend_df.copy()
+
+    st.markdown(f"##### 🏆 Top 3 in {selected_trend_cat}")
+    top_3 = display_df.head(3)
     cols = st.columns(3)
     
     for i, (_, row) in enumerate(top_3.iterrows()):
         with cols[i]:
-            # Clean the tag
             tag_name = f"#{str(row['tag']).replace('#', '')}"
-            # Extract just the short label (e.g., "🔥 Viral" or "📈 Trending Up")
-            short_reason = row['trend_reason'].split(':')[0] 
-            uses = int(row['recent_count'])
-            
-            # Use Streamlit's native metric card for a clean, analytical look
             st.metric(
-                label=short_reason, 
+                label=row['trend_reason'], 
                 value=tag_name, 
-                delta=f"{uses} recent uses", 
+                delta=f"{int(row['recent_count'])} recent uses", 
                 delta_color="normal"
             )
 
-    st.divider()
-
-    # --- UPGRADE 2: Analytical Leaderboard ---
-    st.markdown("##### 📊 Full Trend Leaderboard")
+    st.markdown("##### 📊 Full Leaderboard")
     
     clean_trend_df = pd.DataFrame()
-    clean_trend_df["Trending Hashtag"] = trend_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
-    clean_trend_df["Trend Analysis"] = trend_df["trend_reason"]
-    clean_trend_df["Volume"] = trend_df["recent_count"].astype(int)
+    clean_trend_df["Hashtag"] = display_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
+    clean_trend_df["Primary Category"] = display_df["category"]
+    clean_trend_df["Status"] = display_df["trend_reason"]
+    clean_trend_df["Volume"] = display_df["recent_count"].astype(int)
     
-    # Get the maximum volume to scale our progress bars
     max_volume = int(clean_trend_df["Volume"].max()) if not clean_trend_df.empty else 10
 
-    # Display the dataframe with advanced column configuration
     st.dataframe(
         clean_trend_df.head(50),
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Trending Hashtag": st.column_config.TextColumn(
-                "Hashtag", 
-                width="medium"
-            ),
-            "Trend Analysis": st.column_config.TextColumn(
-                "Why is it trending?", 
-                width="large"
-            ),
+            "Hashtag": st.column_config.TextColumn("Trending Hashtag", width="medium"),
+            "Primary Category": st.column_config.TextColumn("Category"),
+            "Status": st.column_config.TextColumn("Trend Status", width="medium"),
             "Volume": st.column_config.ProgressColumn(
                 "Recent Volume",
-                help="Visual indicator of recent usage volume relative to the top trend.",
+                help="Visual indicator of recent usage volume.",
                 format="%d uses",
                 min_value=0,
                 max_value=max_volume,
