@@ -500,20 +500,22 @@ if len(trend_df) > 0:
 
     st.markdown("##### 📊 Full Analytical Leaderboard")
     
-    # 1. Add the advanced metrics into our clean display dataframe
+    # 1. Translate raw math into user-friendly metrics
     clean_trend_df = pd.DataFrame()
     clean_trend_df["Hashtag"] = display_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
     clean_trend_df["Primary Category"] = display_df["category"]
     
-    clean_trend_df["Velocity"] = display_df["velocity"]
-    clean_trend_df["Engagement"] = display_df["engagement_growth"]
-    clean_trend_df["Trend Score"] = display_df["trend_score"]
+    # Convert multipliers (e.g., 1.04) into percentage change (e.g., +4%)
+    clean_trend_df["Velocity"] = (display_df["velocity"] - 1.0) * 100
+    clean_trend_df["Engagement"] = (display_df["engagement_growth"] - 1.0) * 100
+    
+    # Convert raw 0.0-1.0 score into a 0-100 "Index"
+    clean_trend_df["Trend Index"] = (display_df["trend_score"] * 100).astype(int)
     
     clean_trend_df["Volume"] = display_df["recent_count"].astype(int)
-    
     max_volume = int(clean_trend_df["Volume"].max()) if not clean_trend_df.empty else 10
 
-    # 2. Format the columns to look like a professional SaaS dashboard
+    # 2. Use Streamlit column configs to format the UI beautifully
     st.dataframe(
         clean_trend_df.head(50),
         use_container_width=True,
@@ -523,18 +525,20 @@ if len(trend_df) > 0:
             "Primary Category": st.column_config.TextColumn("Category"),
             "Velocity": st.column_config.NumberColumn(
                 "Velocity", 
-                help="How fast usage is growing compared to past months (> 1.0x means growing).",
-                format="%.2f x"  # Formats 1.5 as "1.50 x"
+                help="Percentage change in usage speed compared to the previous period.",
+                format="%+d%%"  # Automatically formats as +5% or -20%
             ),
             "Engagement": st.column_config.NumberColumn(
                 "Eng. Growth", 
-                help="How much audience engagement (likes/comments) is increasing.",
-                format="%.2f x"
+                help="Percentage change in audience engagement (likes/comments).",
+                format="%+d%%"
             ),
-            "Trend Score": st.column_config.NumberColumn(
-                "Trend Score", 
-                help="The algorithm's final weighted rank score.",
-                format="%.3f"
+            "Trend Index": st.column_config.ProgressColumn(
+                "Trend Index", 
+                help="Overall algorithmic trend strength (0-100 scale).",
+                format="%d",
+                min_value=0,
+                max_value=100
             ),
             "Volume": st.column_config.ProgressColumn(
                 f"Volume (Last {RECENT_DAYS} Days)",
