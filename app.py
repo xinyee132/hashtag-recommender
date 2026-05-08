@@ -81,7 +81,7 @@ def get_model_text(bundle, caption: str, category: str):
     caption = str(caption).strip().lower()
     return f"{category} {caption}" if bundle.get("use_category", False) else caption
 
-# Make trend explanations punchy and analytical for the UI
+# Make trend explanations punchy and remove the clutter of "steady baseline"
 def generate_trend_explanation(row):
     vel = row["velocity"]
     eng_growth = row["engagement_growth"]
@@ -96,7 +96,8 @@ def generate_trend_explanation(row):
     elif recent_ct >= 10: 
         return "⭐ Established Staple"
     else:
-        return "🌱 Steady Baseline"
+        # Return empty string for steady tags to keep UI clean
+        return "" 
 
 # =========================================================
 # OPTIONAL MODEL LOADER: SBERT + LR
@@ -134,7 +135,7 @@ def load_dataset(csv_path: str):
     df = pd.read_csv(csv_path)
     df["hashtags_list"] = df["hashtags_list"].apply(safe_parse)
     df["clean_caption"] = df["clean_caption"].fillna("")
-    df["category"] = df["category"].fillna("unknown").astype(str).str.title().str.strip() # Clean formatting
+    df["category"] = df["category"].fillna("unknown").astype(str).str.title().str.strip() 
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -236,7 +237,6 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     older_eng_sum = defaultdict(float)
     recent_recency_sum = defaultdict(float)
     
-    # Track categories for each hashtag
     tag_categories = defaultdict(Counter)
 
     for _, row in recent_df.iterrows():
@@ -279,7 +279,6 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
         engagement_growth = (r_avg_eng + 1) / (o_avg_eng + 1)
         recency_score = recent_recency_sum.get(tag, 0.0)
         
-        # Determine the primary category for the filter
         primary_domain = tag_categories[tag].most_common(1)[0][0] if tag_categories[tag] else "General"
 
         rows.append({
@@ -463,7 +462,6 @@ if run_btn:
 
         st.success("Recommendations Generated!")
         
-        # Cleanly format the tags ensuring no double ##
         clean_tags = [f"#{str(t).replace('#', '')}" for t in final_tags]
         st.code(" ".join(clean_tags), language="markdown")
 
@@ -471,7 +469,7 @@ st.divider()
 
 # --- SECTION 2: GLOBAL TRENDS ---
 st.subheader("🔥 Platform Trends Dashboard")
-st.caption("Filter and discover which topics are gaining traction across the platform right now.")
+st.caption(f"Filter and discover which topics gained traction over the last {RECENT_DAYS} days.")
 
 trend_df = system["trend_df"]
 
@@ -492,10 +490,13 @@ if len(trend_df) > 0:
     for i, (_, row) in enumerate(top_3.iterrows()):
         with cols[i]:
             tag_name = f"#{str(row['tag']).replace('#', '')}"
+            # Clean fallback: show category if it's not a viral trend
+            status_label = row['trend_reason'] if row['trend_reason'] else f"📌 {row['category']}"
+            
             st.metric(
-                label=row['trend_reason'], 
+                label=status_label, 
                 value=tag_name, 
-                delta=f"{int(row['recent_count'])} recent uses", 
+                delta=f"{int(row['recent_count'])} uses (Last {RECENT_DAYS} Days)", 
                 delta_color="normal"
             )
 
@@ -504,7 +505,8 @@ if len(trend_df) > 0:
     clean_trend_df = pd.DataFrame()
     clean_trend_df["Hashtag"] = display_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
     clean_trend_df["Primary Category"] = display_df["category"]
-    clean_trend_df["Status"] = display_df["trend_reason"]
+    # Replace empty strings with a clean dash for non-trending items
+    clean_trend_df["Status"] = display_df["trend_reason"].apply(lambda x: x if x else "—")
     clean_trend_df["Volume"] = display_df["recent_count"].astype(int)
     
     max_volume = int(clean_trend_df["Volume"].max()) if not clean_trend_df.empty else 10
@@ -518,8 +520,8 @@ if len(trend_df) > 0:
             "Primary Category": st.column_config.TextColumn("Category"),
             "Status": st.column_config.TextColumn("Trend Status", width="medium"),
             "Volume": st.column_config.ProgressColumn(
-                "Recent Volume",
-                help="Visual indicator of recent usage volume.",
+                f"Volume (Last {RECENT_DAYS} Days)",
+                help=f"Visual indicator of usage volume over the past {RECENT_DAYS} days.",
                 format="%d uses",
                 min_value=0,
                 max_value=max_volume,
