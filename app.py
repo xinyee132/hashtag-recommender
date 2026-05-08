@@ -76,6 +76,11 @@ def minmax_col(series):
         return pd.Series(np.zeros(len(series)), index=series.index)
     return (series - mn) / (mx - mn)
 
+def get_model_text(bundle, caption: str, category: str):
+    category = str(category).strip().lower()
+    caption = str(caption).strip().lower()
+    return f"{category} {caption}" if bundle.get("use_category", False) else caption
+
 # =========================================================
 # OPTIONAL MODEL LOADER: SBERT + LR
 # =========================================================
@@ -100,7 +105,7 @@ def load_sbert_lr_bundle(export_dir=MODEL_DIR):
         "model": clf,
         "vectorizer": embedder,
         "mlb": meta["mlb"],
-        "use_category": meta["use_category"],
+        "use_category": meta.get("use_category", True),
         "model_type": meta["model_type"],
     }
 
@@ -112,6 +117,7 @@ def load_dataset(csv_path: str):
     df = pd.read_csv(csv_path)
     df["hashtags_list"] = df["hashtags_list"].apply(safe_parse)
     df["clean_caption"] = df["clean_caption"].fillna("")
+    df["category"] = df["category"].fillna("unknown").astype(str).str.lower().str.strip()
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -134,17 +140,21 @@ def prepare_experiment_data(df: pd.DataFrame, top_n_hashtags=TOP_N_HASHTAGS):
     work_df = df.copy()
     work_df["hashtags_list"] = work_df["hashtags_list"].apply(lambda tags: [t for t in tags if t in top_tags])
     work_df = work_df[work_df["hashtags_list"].map(len) > 0].reset_index(drop=True)
-    work_df["model_text"] = work_df["clean_caption"]
+    
+    # Base models will use the category + caption
+    work_df["model_text"] = work_df["category"] + " " + work_df["clean_caption"]
 
     mlb = MultiLabelBinarizer()
     y = mlb.fit_transform(work_df["hashtags_list"])
+    categories = work_df["category"].values
 
     from sklearn.model_selection import train_test_split
     train_df, temp_df, y_train, y_temp = train_test_split(
-        work_df, y, test_size=0.2, random_state=SEED
+        work_df, y, test_size=0.2, random_state=SEED, stratify=categories
     )
+    temp_categories = temp_df["category"].values
     val_df, test_df, y_val, y_test = train_test_split(
-        temp_df, y_temp, test_size=0.5, random_state=SEED
+        temp_df, y_temp, test_size=0.5, random_state=SEED, stratify=temp_categories
     )
 
     return {
@@ -155,7 +165,7 @@ def prepare_experiment_data(df: pd.DataFrame, top_n_hashtags=TOP_N_HASHTAGS):
         "y_val": y_val,
         "y_test": y_test,
         "mlb": mlb,
-        "use_category": False,
+        "use_category": True,
     }
 
 # =========================================================
@@ -181,7 +191,7 @@ def run_caption_svm(_train_text, _y_train, _mlb):
         "model": model,
         "vectorizer": tfidf,
         "mlb": _mlb,
-        "use_category": False,
+        "use_category": True,
         "model_type": "sklearn",
     }
 
@@ -282,8 +292,8 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
 # =========================================================
 # CORE RERANKING LOGIC
 # =========================================================
-def get_bundle_scores(bundle, caption: str):
-    model_text = caption.strip().lower()
+def get_bundle_scores(bundle, caption: str, category: str):
+    model_text = get_model_text(bundle, caption, category)
 
     if bundle["model_type"] == "sklearn":
         X = bundle["vectorizer"].transform([model_text])
@@ -306,20 +316,19 @@ def compute_semantic_cos_score(bundle, caption: str, tag: str):
         tag_emb = bundle["vectorizer"].encode([tag])
         return float(cosine_similarity(cap_emb, tag_emb)[0][0])
     else:
-        # Fallback for TFIDF
         cap_vec = bundle["vectorizer"].transform([caption])
         tag_vec = bundle["vectorizer"].transform([tag])
         return float(cosine_similarity(cap_vec, tag_vec)[0][0])
 
-def raw_predict(bundle, caption: str, candidate_pool=50):
-    scores = get_bundle_scores(bundle, caption)
+def raw_predict(bundle, caption: str, category: str, candidate_pool=50):
+    scores = get_bundle_scores(bundle, caption, category)
     cand_idx = np.argsort(scores)[::-1][:candidate_pool]
     cand_tags = [bundle["mlb"].classes_[i] for i in cand_idx]
     cand_scores = {tag: float(scores[i]) for tag, i in zip(cand_tags, cand_idx)}
     return cand_scores
 
-def strict_rerank_pipeline(bundle, trend_score_dict, caption: str, candidate_pool=50, top_k=5):
-    cand_scores = raw_predict(bundle, caption, candidate_pool=candidate_pool)
+def strict_rerank_pipeline(bundle, trend_score_dict, caption: str, category: str, candidate_pool=50, top_k=5):
+    cand_scores = raw_predict(bundle, caption, category, candidate_pool=candidate_pool)
     cand_norm = minmax_normalize_dict(cand_scores)
 
     rows = []
@@ -369,7 +378,7 @@ def build_app_objects(csv_path: str):
     except Exception:
         sbert_lr_bundle = None
 
-    models = {"SVM": svm_bundle}
+    models = {"SVM (Base)": svm_bundle}
     if sbert_lr_bundle is not None:
         models["SBERT + LR"] = sbert_lr_bundle
 
@@ -381,17 +390,17 @@ def build_app_objects(csv_path: str):
         "trend_score_dict": trend_score_dict,
     }
 
-def run_model_family(system, family_name, caption, top_k=5, candidate_pool=50):
+def run_model_family(system, family_name, caption, category, top_k=5, candidate_pool=50):
     trend_score_dict = system["trend_score_dict"]
 
     if family_name == "SVM (Base)":
-        bundle = system["models"]["SVM"]
+        bundle = system["models"]["SVM (Base)"]
     elif family_name == "SBERT + LR":
         bundle = system["models"]["SBERT + LR"]
     else:
         raise ValueError(f"Unknown family: {family_name}")
 
-    final_tags, final_rows = strict_rerank_pipeline(bundle, trend_score_dict, caption, candidate_pool, top_k)
+    final_tags, final_rows = strict_rerank_pipeline(bundle, trend_score_dict, caption, category, candidate_pool, top_k)
 
     return {
         "final_tags": final_tags,
@@ -405,6 +414,8 @@ st.title("Caption-Driven Hashtag Recommender")
 st.caption("A purely semantic and trend-based recommendation system.")
 
 system = build_app_objects(str(DATA_PATH))
+categories = sorted(system["exp"]["train_df"]["category"].dropna().unique().tolist())
+
 family_options = ["SVM (Base)"]
 if "SBERT + LR" in system["models"]:
     family_options.append("SBERT + LR")
@@ -414,7 +425,13 @@ tab1, tab2 = st.tabs(["Hashtag Recommender", "Trend Leaderboard"])
 with tab1:
     st.subheader("Generate Hashtags")
     
-    selected_family = st.selectbox("Select Recommendation Model", family_options, index=0)
+    col_cat, col_fam = st.columns([1, 1])
+    with col_cat:
+        default_idx = categories.index("fitness") if "fitness" in categories else 0
+        category = st.selectbox("Select Post Category", categories, index=default_idx)
+    with col_fam:
+        selected_family = st.selectbox("Select Recommendation Model", family_options, index=0)
+    
     caption = st.text_area("Post Caption", value="Having a great morning workout at the gym, feeling strong today!", height=100)
     
     col1, col2 = st.columns([1, 1])
@@ -430,7 +447,7 @@ with tab1:
             st.warning("Please enter a caption.")
         else:
             with st.spinner("Analyzing semantics and trends..."):
-                result = run_model_family(system, selected_family, caption, top_k, candidate_pool)
+                result = run_model_family(system, selected_family, caption, category, top_k, candidate_pool)
 
             st.success("Recommendations Generated!")
             st.subheader("Recommended Hashtags")
