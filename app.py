@@ -81,7 +81,7 @@ def get_model_text(bundle, caption: str, category: str):
     caption = str(caption).strip().lower()
     return f"{category} {caption}" if bundle.get("use_category", False) else caption
 
-# Make trend explanations punchy and remove the clutter of "steady baseline"
+# Make trend explanations punchy
 def generate_trend_explanation(row):
     vel = row["velocity"]
     eng_growth = row["engagement_growth"]
@@ -96,7 +96,6 @@ def generate_trend_explanation(row):
     elif recent_ct >= 10: 
         return "⭐ Established Staple"
     else:
-        # Return empty string for steady tags to keep UI clean
         return "" 
 
 # =========================================================
@@ -505,8 +504,9 @@ if len(trend_df) > 0:
     clean_trend_df = pd.DataFrame()
     clean_trend_df["Hashtag"] = display_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
     clean_trend_df["Primary Category"] = display_df["category"]
-    # Replace empty strings with a clean dash for non-trending items
-    clean_trend_df["Status"] = display_df["trend_reason"].apply(lambda x: x if x else "—")
+    
+    # We removed the "Trend Status" column entirely here to keep it clean
+    
     clean_trend_df["Volume"] = display_df["recent_count"].astype(int)
     
     max_volume = int(clean_trend_df["Volume"].max()) if not clean_trend_df.empty else 10
@@ -518,7 +518,6 @@ if len(trend_df) > 0:
         column_config={
             "Hashtag": st.column_config.TextColumn("Trending Hashtag", width="medium"),
             "Primary Category": st.column_config.TextColumn("Category"),
-            "Status": st.column_config.TextColumn("Trend Status", width="medium"),
             "Volume": st.column_config.ProgressColumn(
                 f"Volume (Last {RECENT_DAYS} Days)",
                 help=f"Visual indicator of usage volume over the past {RECENT_DAYS} days.",
