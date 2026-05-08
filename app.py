@@ -14,6 +14,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.svm import LinearSVC
 from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # =========================================================
 # PAGE CONFIG
@@ -38,24 +39,16 @@ RECENT_DAYS = 30
 OLDER_DAYS = 90
 TREND_MIN_FREQ = 3
 
-# Trend Reranker Weights
-TREND_W_BASE = 0.55
-TREND_W_TREND = 0.20
-TREND_W_CAT = 0.15
-TREND_W_LEX = 0.10
-TREND_GENERIC_PENALTY = 0.12
+# Strictly matching the updated model parameters
+TREND_W_BASE = 0.70
+TREND_W_COS = 0.20
+TREND_W_TREND = 0.10
+GENERIC_PENALTY_VAL = 0.00  
 
 GENERIC_TAGS = {
     "#ad", "#love", "#instagood", "#photooftheday", "#photography",
     "#happy", "#happiness", "#life", "#beautiful", "#art", "#support"
 }
-
-SAMPLE_CAPTIONS = [
-    ("Having a great morning workout at the gym, feeling strong today!", "fitness"),
-    ("Enjoying a delicious homemade vegan pasta for dinner", "food"),
-    ("Sunset view at the beach during vacation", "travel"),
-    ("New outfit for the weekend brunch", "fashion"),
-]
 
 # =========================================================
 # HELPERS
@@ -65,19 +58,6 @@ def safe_parse(x):
         return ast.literal_eval(x) if isinstance(x, str) else []
     except Exception:
         return []
-
-def tokenize(text: str):
-    text = str(text).lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text.split()
-
-def hashtag_token(tag: str):
-    tag = str(tag).lower().replace("#", "")
-    tag = re.sub(r"[_\-]", " ", tag)
-    tag = re.sub(r"[^a-z0-9\s]", "", tag)
-    tag = re.sub(r"\s+", " ", tag).strip()
-    return tag
 
 def minmax_normalize_dict(d):
     if len(d) == 0:
@@ -95,21 +75,6 @@ def minmax_col(series):
     if mx - mn == 0:
         return pd.Series(np.zeros(len(series)), index=series.index)
     return (series - mn) / (mx - mn)
-
-def lexical_similarity(caption, tag):
-    words = set(tokenize(caption))
-    token = hashtag_token(tag)
-    if token in words:
-        return 1.0
-    for w in words:
-        if token in w or w in token:
-            return 0.6
-    return 0.0
-
-def get_model_text(bundle, caption: str, category: str):
-    category = str(category).strip().lower()
-    caption = str(caption).strip().lower()
-    return f"{category} {caption}" if bundle["use_category"] else caption
 
 # =========================================================
 # OPTIONAL MODEL LOADER: SBERT + LR
@@ -147,14 +112,12 @@ def load_dataset(csv_path: str):
     df = pd.read_csv(csv_path)
     df["hashtags_list"] = df["hashtags_list"].apply(safe_parse)
     df["clean_caption"] = df["clean_caption"].fillna("")
-    df["category"] = df["category"].fillna("unknown").astype(str).str.lower().str.strip()
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     else:
         df["timestamp"] = pd.NaT
 
-    # Ensure required columns for engagement formula exist
     if "likes" not in df.columns: df["likes"] = 0
     if "comment_count" not in df.columns: df["comment_count"] = 0
     if "followers" not in df.columns: df["followers"] = 0
@@ -164,30 +127,24 @@ def load_dataset(csv_path: str):
 # =========================================================
 # EXPERIMENT PREP
 # =========================================================
-def prepare_experiment_data(df: pd.DataFrame, use_category=True, top_n_hashtags=TOP_N_HASHTAGS):
+def prepare_experiment_data(df: pd.DataFrame, top_n_hashtags=TOP_N_HASHTAGS):
     all_tags = [tag for tags in df["hashtags_list"] for tag in tags]
     top_tags = set([tag for tag, _ in Counter(all_tags).most_common(top_n_hashtags)])
 
     work_df = df.copy()
     work_df["hashtags_list"] = work_df["hashtags_list"].apply(lambda tags: [t for t in tags if t in top_tags])
     work_df = work_df[work_df["hashtags_list"].map(len) > 0].reset_index(drop=True)
-
-    if use_category:
-        work_df["model_text"] = work_df["category"] + " " + work_df["clean_caption"]
-    else:
-        work_df["model_text"] = work_df["clean_caption"]
+    work_df["model_text"] = work_df["clean_caption"]
 
     mlb = MultiLabelBinarizer()
     y = mlb.fit_transform(work_df["hashtags_list"])
-    categories = work_df["category"].values
 
     from sklearn.model_selection import train_test_split
     train_df, temp_df, y_train, y_temp = train_test_split(
-        work_df, y, test_size=0.2, random_state=SEED, stratify=categories
+        work_df, y, test_size=0.2, random_state=SEED
     )
-    temp_categories = temp_df["category"].values
     val_df, test_df, y_val, y_test = train_test_split(
-        temp_df, y_temp, test_size=0.5, random_state=SEED, stratify=temp_categories
+        temp_df, y_temp, test_size=0.5, random_state=SEED
     )
 
     return {
@@ -198,14 +155,14 @@ def prepare_experiment_data(df: pd.DataFrame, use_category=True, top_n_hashtags=
         "y_val": y_val,
         "y_test": y_test,
         "mlb": mlb,
-        "use_category": use_category,
+        "use_category": False,
     }
 
 # =========================================================
 # MODEL TRAINING: SVM
 # =========================================================
 @st.cache_resource
-def run_caption_category_svm(_train_text, _y_train, _mlb):
+def run_caption_svm(_train_text, _y_train, _mlb):
     tfidf = TfidfVectorizer(
         max_features=MAX_FEATURES_TFIDF,
         ngram_range=(1, 1),
@@ -219,63 +176,31 @@ def run_caption_category_svm(_train_text, _y_train, _mlb):
     model.fit(X_train, _y_train)
 
     return {
-        "name": "caption_category_svm",
+        "name": "caption_svm",
         "display_name": "SVM",
         "model": model,
         "vectorizer": tfidf,
         "mlb": _mlb,
-        "use_category": True,
+        "use_category": False,
         "model_type": "sklearn",
     }
 
 # =========================================================
-# AUXILIARY TABLES & TREND EXPLAINABILITY
+# TREND SCORING
 # =========================================================
-def build_category_affinity(train_df):
-    category_tag_counts = defaultdict(Counter)
-    for _, row in train_df.iterrows():
-        cat = str(row["category"]).lower().strip()
-        for tag in row["hashtags_list"]:
-            category_tag_counts[cat][tag] += 1
-
-    affinity = defaultdict(dict)
-    for cat, counter in category_tag_counts.items():
-        total = sum(counter.values())
-        for tag, cnt in counter.items():
-            affinity[cat][tag] = cnt / total if total > 0 else 0.0
-    return affinity
-
 def prepare_trend_base_df(train_df):
     df = train_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"]).copy()
     
-    # NEW ENGAGEMENT FORMULA: (likes + comments) / (followers + 1)
     df["engagement_rate"] = (df["likes"].fillna(0) + df["comment_count"].fillna(0)) / (df["followers"].fillna(0) + 1)
     return df
-
-def generate_trend_explanation(row):
-    """Provides a human-readable, user-friendly explanation for why a hashtag is trending."""
-    vel = row["velocity"]
-    eng_growth = row["engagement_growth"]
-    recent_ct = row["recent_count"]
-
-    if vel >= 1.5 and eng_growth >= 1.2:
-        return "🔥 Viral & Engaging: Rapid usage spike with high audience interaction."
-    elif vel >= 1.5:
-        return "📈 Trending Up: Usage frequency is significantly higher than past months."
-    elif eng_growth >= 1.5:
-        return "💬 Conversation Starter: Generating unusually high likes and comments."
-    elif recent_ct >= 10: 
-        return "⭐ Consistent Staple: Highly reliable and frequently used."
-    else:
-        return "🌱 Emerging: Showing steady baseline traction."
 
 def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_DAYS, min_freq=TREND_MIN_FREQ):
     df = prepare_trend_base_df(train_df)
 
     if len(df) == 0:
-        return pd.DataFrame(columns=["tag", "domain", "trend_score", "trend_reason"]), {}
+        return pd.DataFrame(), {}
 
     max_time = df["timestamp"].max()
     recent_start = max_time - pd.Timedelta(days=recent_days)
@@ -289,14 +214,10 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     recent_eng_sum = defaultdict(float)
     older_eng_sum = defaultdict(float)
     recent_recency_sum = defaultdict(float)
-    
-    # Track which category each tag belongs to
-    tag_categories = defaultdict(Counter)
 
     for _, row in recent_df.iterrows():
         tags = row["hashtags_list"]
         eng = float(row["engagement_rate"])
-        cat = str(row["category"]).strip().lower()
         age_days = max((max_time - row["timestamp"]).days, 0)
         recency_weight = 1 / (1 + age_days)
 
@@ -304,17 +225,14 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
             recent_counts[tag] += 1
             recent_eng_sum[tag] += eng
             recent_recency_sum[tag] += recency_weight
-            tag_categories[tag][cat] += 1
 
     for _, row in older_df.iterrows():
         tags = row["hashtags_list"]
         eng = float(row["engagement_rate"])
-        cat = str(row["category"]).strip().lower()
 
         for tag in tags:
             older_counts[tag] += 1
             older_eng_sum[tag] += eng
-            tag_categories[tag][cat] += 1
 
     all_tags = set(recent_counts.keys()) | set(older_counts.keys())
     rows = []
@@ -332,18 +250,11 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
         velocity = (r_count + 1) / (o_count + 1)
         engagement_growth = (r_avg_eng + 1) / (o_avg_eng + 1)
         recency_score = recent_recency_sum.get(tag, 0.0)
-        
-        # Extract the Primary Domain for the tag
-        primary_domain = tag_categories[tag].most_common(1)[0][0] if tag_categories[tag] else "General"
 
         rows.append({
             "tag": tag,
-            "domain": primary_domain.title(),
             "recent_count": r_count,
             "older_count": o_count,
-            "total_freq": total_freq,
-            "recent_avg_engagement": r_avg_eng,
-            "older_avg_engagement": o_avg_eng,
             "velocity": velocity,
             "engagement_growth": engagement_growth,
             "recency_score": recency_score,
@@ -352,7 +263,7 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
     trend_df = pd.DataFrame(rows)
 
     if len(trend_df) == 0:
-        return pd.DataFrame(columns=["tag", "domain", "trend_score", "trend_reason"]), {}
+        return pd.DataFrame(), {}
 
     trend_df["velocity_norm"] = minmax_col(trend_df["velocity"])
     trend_df["engagement_growth_norm"] = minmax_col(trend_df["engagement_growth"])
@@ -364,90 +275,64 @@ def build_trend_score_table(train_df, recent_days=RECENT_DAYS, older_days=OLDER_
         0.20 * trend_df["recency_norm"]
     )
     
-    # Add Explainability
-    trend_df["trend_reason"] = trend_df.apply(generate_trend_explanation, axis=1)
-
     trend_df = trend_df.sort_values("trend_score", ascending=False).reset_index(drop=True)
     trend_score_dict = dict(zip(trend_df["tag"], trend_df["trend_score"]))
     return trend_df, trend_score_dict
 
 # =========================================================
-# GENERIC BUNDLE SCORING
+# CORE RERANKING LOGIC
 # =========================================================
-def get_bundle_scores(bundle, caption: str, category: str):
-    model_text = get_model_text(bundle, caption, category)
+def get_bundle_scores(bundle, caption: str):
+    model_text = caption.strip().lower()
 
     if bundle["model_type"] == "sklearn":
         X = bundle["vectorizer"].transform([model_text])
         scores = bundle["model"].decision_function(X)[0]
-    elif bundle["model_type"] == "embedding_clf":
+    elif bundle["model_type"] in ["embedding_clf", "embedding_clf_proba"]:
         X = bundle["vectorizer"].encode([model_text], convert_to_numpy=True, normalize_embeddings=True)
-        scores = bundle["model"].decision_function(X)[0]
-    elif bundle["model_type"] == "embedding_clf_proba":
-        X = bundle["vectorizer"].encode([model_text], convert_to_numpy=True, normalize_embeddings=True)
-        scores = bundle["model"].predict_proba(X)[0]
+        scores = bundle["model"].predict_proba(X)[0] if bundle["model_type"] == "embedding_clf_proba" else bundle["model"].decision_function(X)[0]
     else:
         raise ValueError(f"Unsupported model_type: {bundle['model_type']}")
 
     return scores
 
-# =========================================================
-# PIPELINES
-# =========================================================
-def raw_predict(bundle, caption: str, category: str, top_k=5, candidate_pool=20):
-    scores = get_bundle_scores(bundle, caption, category)
-    top_idx = np.argsort(scores)[::-1][:top_k]
-    tags = [bundle["mlb"].classes_[i] for i in top_idx]
+def compute_semantic_cos_score(bundle, caption: str, tag: str):
+    """Computes pure text-based semantic cosine similarity."""
+    if not caption.strip():
+        return 0.0
+    
+    if bundle["model_type"] in ["embedding_clf", "embedding_clf_proba"]:
+        cap_emb = bundle["vectorizer"].encode([caption])
+        tag_emb = bundle["vectorizer"].encode([tag])
+        return float(cosine_similarity(cap_emb, tag_emb)[0][0])
+    else:
+        # Fallback for TFIDF
+        cap_vec = bundle["vectorizer"].transform([caption])
+        tag_vec = bundle["vectorizer"].transform([tag])
+        return float(cosine_similarity(cap_vec, tag_vec)[0][0])
 
+def raw_predict(bundle, caption: str, candidate_pool=50):
+    scores = get_bundle_scores(bundle, caption)
     cand_idx = np.argsort(scores)[::-1][:candidate_pool]
     cand_tags = [bundle["mlb"].classes_[i] for i in cand_idx]
     cand_scores = {tag: float(scores[i]) for tag, i in zip(cand_tags, cand_idx)}
-    return tags, cand_scores
+    return cand_scores
 
-def lexical_rerank(bundle, category_affinity, caption: str, category: str, candidate_pool=20, top_k=5):
-    _, cand_scores = raw_predict(bundle, caption, category, top_k=top_k, candidate_pool=candidate_pool)
+def strict_rerank_pipeline(bundle, trend_score_dict, caption: str, candidate_pool=50, top_k=5):
+    cand_scores = raw_predict(bundle, caption, candidate_pool=candidate_pool)
     cand_norm = minmax_normalize_dict(cand_scores)
-    category = str(category).strip().lower()
-
-    rows = []
-    for tag in cand_scores.keys():
-        base_score = cand_norm.get(tag, 0.0)
-        cat_score = category_affinity.get(category, {}).get(tag, 0.0)
-        lex_score = lexical_similarity(caption, tag)
-        penalty = TREND_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
-
-        final_score = 0.75 * base_score + 0.15 * cat_score + 0.10 * lex_score - penalty
-        rows.append({
-            "tag": tag,
-            "final_score": float(final_score),
-            "base_score": float(base_score),
-            "cat_score": float(cat_score),
-            "lex_score": float(lex_score),
-            "penalty": float(penalty),
-        })
-
-    rows = sorted(rows, key=lambda x: x["final_score"], reverse=True)
-    return [r["tag"] for r in rows[:top_k]], rows
-
-def trend_aware_rerank(bundle, category_affinity, trend_score_dict, caption: str, category: str,
-                       candidate_pool=20, top_k=5):
-    _, cand_scores = raw_predict(bundle, caption, category, top_k=top_k, candidate_pool=candidate_pool)
-    cand_norm = minmax_normalize_dict(cand_scores)
-    category = str(category).strip().lower()
 
     rows = []
     for tag in cand_scores.keys():
         base_score = cand_norm.get(tag, 0.0)
         trend_score = float(trend_score_dict.get(tag, 0.0))
-        cat_score = category_affinity.get(category, {}).get(tag, 0.0)
-        lex_score = lexical_similarity(caption, tag)
-        penalty = TREND_GENERIC_PENALTY if tag in GENERIC_TAGS else 0.0
+        cos_score = compute_semantic_cos_score(bundle, caption, tag)
+        penalty = GENERIC_PENALTY_VAL if tag in GENERIC_TAGS else 0.0
 
         final_score = (
-            TREND_W_BASE * base_score +
-            TREND_W_TREND * trend_score +
-            TREND_W_CAT * cat_score +
-            TREND_W_LEX * lex_score -
+            (TREND_W_BASE * base_score) +
+            (TREND_W_TREND * trend_score) +
+            (TREND_W_COS * cos_score) -
             penalty
         )
 
@@ -455,9 +340,8 @@ def trend_aware_rerank(bundle, category_affinity, trend_score_dict, caption: str
             "tag": tag,
             "final_score": float(final_score),
             "base_score": float(base_score),
+            "cos_score": float(cos_score),
             "trend_score": float(trend_score),
-            "cat_score": float(cat_score),
-            "lex_score": float(lex_score),
             "penalty": float(penalty),
         })
 
@@ -465,113 +349,19 @@ def trend_aware_rerank(bundle, category_affinity, trend_score_dict, caption: str
     return [r["tag"] for r in rows[:top_k]], rows
 
 # =========================================================
-# EVALUATION HELPERS
-# =========================================================
-def evaluate_rank_metrics(y_true, y_scores, k_values=[1, 3, 5]):
-    from sklearn.metrics import ndcg_score, label_ranking_average_precision_score
-    results = {}
-    results["LRAP"] = float(label_ranking_average_precision_score(y_true, y_scores))
-
-    n_samples = y_true.shape[0]
-    valid_samples = 0
-    metrics = {
-        "P": {k: 0.0 for k in k_values},
-        "R": {k: 0.0 for k in k_values},
-        "Hit": {k: 0.0 for k in k_values},
-        "MAP": {k: 0.0 for k in k_values},
-    }
-
-    for i in range(n_samples):
-        true_indices = np.where(y_true[i] == 1)[0]
-        if len(true_indices) == 0: continue
-
-        valid_samples += 1
-        ranked_indices = np.argsort(y_scores[i])[::-1]
-
-        for k in k_values:
-            top_indices = ranked_indices[:k]
-            hits = len(set(top_indices).intersection(set(true_indices)))
-            metrics["P"][k] += hits / k
-            metrics["R"][k] += hits / len(true_indices)
-            metrics["Hit"][k] += 1 if hits > 0 else 0
-
-            ap = 0.0
-            hits_so_far = 0
-            for rank, pred_idx in enumerate(top_indices, start=1):
-                if pred_idx in true_indices:
-                    hits_so_far += 1
-                    ap += hits_so_far / rank
-            metrics["MAP"][k] += ap / min(k, len(true_indices))
-
-    for k in k_values:
-        p_at_k = metrics["P"][k] / valid_samples
-        r_at_k = metrics["R"][k] / valid_samples
-        f1_at_k = 2 * (p_at_k * r_at_k) / (p_at_k + r_at_k) if (p_at_k + r_at_k) > 0 else 0.0
-        hit_at_k = metrics["Hit"][k] / valid_samples
-        map_at_k = metrics["MAP"][k] / valid_samples
-        ndcg_at_k = ndcg_score(y_true, y_scores, k=k)
-
-        results[f"P@{k}"] = float(p_at_k)
-        results[f"R@{k}"] = float(r_at_k)
-        results[f"F1@{k}"] = float(f1_at_k)
-        results[f"Hit@{k}"] = float(hit_at_k)
-        results[f"MAP@{k}"] = float(map_at_k)
-        results[f"NDCG@{k}"] = float(ndcg_at_k)
-
-    return results
-
-def tags_to_score_vector(tags, mlb, full_length_score=False):
-    vec = np.zeros(len(mlb.classes_))
-    tag_to_idx = {t: i for i, t in enumerate(mlb.classes_)}
-    n = len(tags)
-    for rank, tag in enumerate(tags):
-        if tag in tag_to_idx:
-            vec[tag_to_idx[tag]] = (n - rank) if full_length_score else 1.0
-    return vec
-
-def get_trend_scores(bundle, category_affinity, trend_score_dict, df_split, top_k=5):
-    all_scores = []
-    for _, row in df_split.iterrows():
-        tags, _ = trend_aware_rerank(bundle, category_affinity, trend_score_dict, row["clean_caption"], row["category"], top_k=top_k)
-        all_scores.append(tags_to_score_vector(tags, bundle["mlb"], full_length_score=True))
-    return np.array(all_scores)
-
-def summarize_results(results_dict, split_name="val"):
-    rows = []
-    for method, metrics in results_dict.items():
-        rows.append({
-            "split": split_name,
-            "method": method,
-            "LRAP": metrics["LRAP"],
-            "P@1": metrics["P@1"],
-            "P@3": metrics["P@3"],
-            "P@5": metrics["P@5"],
-            "R@3": metrics["R@3"],
-            "R@5": metrics["R@5"],
-            "F1@3": metrics["F1@3"],
-            "F1@5": metrics["F1@5"],
-            "Hit@3": metrics["Hit@3"],
-            "Hit@5": metrics["Hit@5"],
-            "MAP@5": metrics["MAP@5"],
-            "NDCG@5": metrics["NDCG@5"],
-        })
-    return pd.DataFrame(rows)
-
-# =========================================================
-# BUILD APP OBJECTS
+# APP BUILDER & RUNNER
 # =========================================================
 @st.cache_resource
 def build_app_objects(csv_path: str):
     df = load_dataset(csv_path)
-    exp = prepare_experiment_data(df, use_category=True, top_n_hashtags=TOP_N_HASHTAGS)
+    exp = prepare_experiment_data(df, top_n_hashtags=TOP_N_HASHTAGS)
 
-    svm_bundle = run_caption_category_svm(
+    svm_bundle = run_caption_svm(
         _train_text=exp["train_df"]["model_text"],
         _y_train=exp["y_train"],
         _mlb=exp["mlb"]
     )
 
-    category_affinity = build_category_affinity(exp["train_df"])
     trend_df, trend_score_dict = build_trend_score_table(exp["train_df"])
 
     try:
@@ -587,111 +377,51 @@ def build_app_objects(csv_path: str):
         "df": df,
         "exp": exp,
         "models": models,
-        "category_affinity": category_affinity,
         "trend_df": trend_df,
         "trend_score_dict": trend_score_dict,
     }
 
-# =========================================================
-# MODEL FAMILY SELECTOR
-# =========================================================
-def get_family_options(system):
-    options = ["SVM + Trend Reranker"]
-    if "SBERT + LR" in system["models"]:
-        options.append("SBERT + LR")
-    return options
-
-def run_model_family(system, family_name, caption, category, top_k=5, candidate_pool=20):
-    category_affinity = system["category_affinity"]
+def run_model_family(system, family_name, caption, top_k=5, candidate_pool=50):
     trend_score_dict = system["trend_score_dict"]
 
-    if family_name == "SVM + Trend Reranker":
+    if family_name == "SVM (Base)":
         bundle = system["models"]["SVM"]
     elif family_name == "SBERT + LR":
         bundle = system["models"]["SBERT + LR"]
     else:
         raise ValueError(f"Unknown family: {family_name}")
 
-    raw_tags, raw_scores = raw_predict(bundle, caption, category, top_k=top_k, candidate_pool=candidate_pool)
-    lexical_tags, lexical_rows = lexical_rerank(bundle, category_affinity, caption, category, candidate_pool, top_k)
-    trend_tags, trend_rows = trend_aware_rerank(bundle, category_affinity, trend_score_dict, caption, category, candidate_pool, top_k)
+    final_tags, final_rows = strict_rerank_pipeline(bundle, trend_score_dict, caption, candidate_pool, top_k)
 
     return {
-        "family": family_name,
-        "final_name": family_name,
-        "raw_tags": raw_tags,
-        "lexical_tags": lexical_tags,
-        "trend_tags": trend_tags,
-        "final_tags": trend_tags,
-        "lexical_rows": lexical_rows,
-        "trend_rows": trend_rows,
-        "final_rows": trend_rows,
-        "raw_scores": raw_scores,
+        "final_tags": final_tags,
+        "final_rows": final_rows,
     }
-
-# =========================================================
-# EVALUATION RUNNER
-# =========================================================
-def run_demo_evaluation(system):
-    exp = system["exp"]
-    models = system["models"]
-
-    val_results = {
-        "baseline_svm_trend": evaluate_rank_metrics(
-            exp["y_val"],
-            get_trend_scores(models["SVM"], system["category_affinity"], system["trend_score_dict"], exp["val_df"])
-        )
-    }
-    test_results = {
-        "baseline_svm_trend": evaluate_rank_metrics(
-            exp["y_test"],
-            get_trend_scores(models["SVM"], system["category_affinity"], system["trend_score_dict"], exp["test_df"])
-        )
-    }
-
-    if "SBERT + LR" in models:
-        val_results["sbert_lr_trend"] = evaluate_rank_metrics(
-            exp["y_val"],
-            get_trend_scores(models["SBERT + LR"], system["category_affinity"], system["trend_score_dict"], exp["val_df"])
-        )
-        test_results["sbert_lr_trend"] = evaluate_rank_metrics(
-            exp["y_test"],
-            get_trend_scores(models["SBERT + LR"], system["category_affinity"], system["trend_score_dict"], exp["test_df"])
-        )
-
-    val_df = summarize_results(val_results, "val")
-    test_df = summarize_results(test_results, "test")
-    return pd.concat([val_df, test_df], ignore_index=True)
 
 # =========================================================
 # UI
 # =========================================================
-st.title("Social Media Hashtag Recommender & Trends")
-st.caption("A simple interface to generate relevant hashtags and explore what's currently trending.")
+st.title("Caption-Driven Hashtag Recommender")
+st.caption("A purely semantic and trend-based recommendation system.")
 
 system = build_app_objects(str(DATA_PATH))
-categories = sorted(system["exp"]["train_df"]["category"].dropna().unique().tolist())
-family_options = get_family_options(system)
+family_options = ["SVM (Base)"]
+if "SBERT + LR" in system["models"]:
+    family_options.append("SBERT + LR")
 
-tab1, tab2, tab3 = st.tabs(["Hashtag Recommender", "Trend Dashboard", "System Evaluation"])
+tab1, tab2 = st.tabs(["Hashtag Recommender", "Trend Leaderboard"])
 
 with tab1:
     st.subheader("Generate Hashtags")
     
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        default_idx = categories.index("fitness") if "fitness" in categories else 0
-        category = st.selectbox("Select Post Category", categories, index=default_idx)
-    with col2:
-        selected_family = st.selectbox("Select Recommendation Model", family_options, index=0)
-
+    selected_family = st.selectbox("Select Recommendation Model", family_options, index=0)
     caption = st.text_area("Post Caption", value="Having a great morning workout at the gym, feeling strong today!", height=100)
     
-    col3, col4 = st.columns([1, 1])
-    with col3:
+    col1, col2 = st.columns([1, 1])
+    with col1:
         top_k = st.slider("Number of Hashtags to Output", min_value=3, max_value=15, value=5)
-    with col4:
-        candidate_pool = st.slider("Candidate Pool (Internal Search Space)", min_value=10, max_value=50, value=20, step=5)
+    with col2:
+        candidate_pool = st.slider("Candidate Pool (Internal Search Space)", min_value=10, max_value=100, value=50, step=5)
 
     run_btn = st.button("Generate Recommendations", type="primary", use_container_width=True)
 
@@ -699,89 +429,34 @@ with tab1:
         if not caption.strip():
             st.warning("Please enter a caption.")
         else:
-            with st.spinner("Analyzing text and trends..."):
-                result = run_model_family(system, selected_family, caption, category, top_k, candidate_pool)
+            with st.spinner("Analyzing semantics and trends..."):
+                result = run_model_family(system, selected_family, caption, top_k, candidate_pool)
 
             st.success("Recommendations Generated!")
             st.subheader("Recommended Hashtags")
             st.code(" ".join(result["final_tags"]), language="markdown")
             
             st.divider()
-            st.markdown("### Why were these chosen? (Scoring Breakdown)")
-            st.caption("The final score is a weighted combination of the base prediction, current social trends, category relevance, and exact keyword matches.")
+            st.markdown("### Scoring Breakdown")
+            st.caption(f"Strict weights applied: w_base={TREND_W_BASE}, w_cos={TREND_W_COS}, w_trend={TREND_W_TREND}, penalty={GENERIC_PENALTY_VAL}")
             
             breakdown_df = pd.DataFrame(result["final_rows"][:top_k])
             
-            # Safe rendering (No matplotlib dependency required)
             st.dataframe(
-                breakdown_df[["tag", "final_score", "base_score", "trend_score", "cat_score", "lex_score", "penalty"]],
+                breakdown_df[["tag", "final_score", "base_score", "cos_score", "trend_score", "penalty"]],
                 use_container_width=True,
                 hide_index=True
             )
 
 with tab2:
     st.subheader("📊 Social Media Trend Dashboard")
-    st.markdown("Discover which hashtags are gaining traction and why.")
-    
     trend_df = system["trend_df"]
     
     if len(trend_df) > 0:
-        # Domain Filter
-        all_domains = ["All Categories"] + sorted(trend_df["domain"].unique().tolist())
-        selected_domain = st.selectbox("Filter Trends by Category:", all_domains)
-        
-        if selected_domain != "All Categories":
-            display_df = trend_df[trend_df["domain"] == selected_domain].copy()
-        else:
-            display_df = trend_df.copy()
-
-        st.markdown(f"### Top Trending in {selected_domain}")
-        
-        # Display Top 3 in Metric Cards
-        top_3 = display_df.head(3)
-        cols = st.columns(3)
-        
-        for i, (_, row) in enumerate(top_3.iterrows()):
-            if i < 3:
-                with cols[i]:
-                    # Using Markdown to create a clean metric look
-                    st.markdown(f"## `#{row['tag']}`")
-                    st.markdown(f"**Domain:** {row['domain']}  \n**Score:** {row['trend_score']:.2f}")
-                    st.caption(f"_{row['trend_reason']}_")
-
-        st.divider()
-        st.markdown("#### Detailed Leaderboard")
-        
-        # Rename columns for the UI
-        clean_display_df = display_df.rename(columns={
-            "tag": "Hashtag",
-            "domain": "Primary Category",
-            "trend_score": "Trend Score",
-            "trend_reason": "Why is it trending?",
-            "recent_count": "Recent Uses"
-        })
-        
-        # Safe rendering (No matplotlib dependency required)
         st.dataframe(
-            clean_display_df[["Hashtag", "Primary Category", "Why is it trending?", "Trend Score", "Recent Uses"]].head(25),
+            trend_df[["tag", "trend_score", "velocity", "engagement_growth", "recent_count"]].head(50),
             use_container_width=True,
             hide_index=True
         )
     else:
-        st.info("No trend data available. Ensure your dataset contains timestamp, likes, comments, and followers data.")
-
-with tab3:
-    st.subheader("Model Evaluation")
-    st.caption("Compare the precision and recall of the available recommender systems.")
-
-    if st.button("Run Offline Evaluation Test"):
-        with st.spinner("Running evaluation metrics on validation and test sets..."):
-            results_df = run_demo_evaluation(system)
-
-        # Safe rendering (No matplotlib dependency required)
-        st.dataframe(results_df, use_container_width=True, hide_index=True)
-        
-        st.markdown("**Metrics Guide:**")
-        st.markdown("- **LRAP**: Label Ranking Average Precision (Higher is better overall ranking).")
-        st.markdown("- **P@K / R@K**: Precision and Recall at the top K recommendations.")
-        st.markdown("- **Hit@K**: Percentage of predictions where at least 1 correct tag was in the top K.")
+        st.info("No trend data available.")
