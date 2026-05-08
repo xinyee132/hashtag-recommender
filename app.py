@@ -489,7 +489,6 @@ if len(trend_df) > 0:
     for i, (_, row) in enumerate(top_3.iterrows()):
         with cols[i]:
             tag_name = f"#{str(row['tag']).replace('#', '')}"
-            # Clean fallback: show category if it's not a viral trend
             status_label = row['trend_reason'] if row['trend_reason'] else f"📌 {row['category']}"
             
             st.metric(
@@ -499,18 +498,22 @@ if len(trend_df) > 0:
                 delta_color="normal"
             )
 
-    st.markdown("##### 📊 Full Leaderboard")
+    st.markdown("##### 📊 Full Analytical Leaderboard")
     
+    # 1. Add the advanced metrics into our clean display dataframe
     clean_trend_df = pd.DataFrame()
     clean_trend_df["Hashtag"] = display_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
     clean_trend_df["Primary Category"] = display_df["category"]
     
-    # We removed the "Trend Status" column entirely here to keep it clean
+    clean_trend_df["Velocity"] = display_df["velocity"]
+    clean_trend_df["Engagement"] = display_df["engagement_growth"]
+    clean_trend_df["Trend Score"] = display_df["trend_score"]
     
     clean_trend_df["Volume"] = display_df["recent_count"].astype(int)
     
     max_volume = int(clean_trend_df["Volume"].max()) if not clean_trend_df.empty else 10
 
+    # 2. Format the columns to look like a professional SaaS dashboard
     st.dataframe(
         clean_trend_df.head(50),
         use_container_width=True,
@@ -518,9 +521,24 @@ if len(trend_df) > 0:
         column_config={
             "Hashtag": st.column_config.TextColumn("Trending Hashtag", width="medium"),
             "Primary Category": st.column_config.TextColumn("Category"),
+            "Velocity": st.column_config.NumberColumn(
+                "Velocity", 
+                help="How fast usage is growing compared to past months (> 1.0x means growing).",
+                format="%.2f x"  # Formats 1.5 as "1.50 x"
+            ),
+            "Engagement": st.column_config.NumberColumn(
+                "Eng. Growth", 
+                help="How much audience engagement (likes/comments) is increasing.",
+                format="%.2f x"
+            ),
+            "Trend Score": st.column_config.NumberColumn(
+                "Trend Score", 
+                help="The algorithm's final weighted rank score.",
+                format="%.3f"
+            ),
             "Volume": st.column_config.ProgressColumn(
                 f"Volume (Last {RECENT_DAYS} Days)",
-                help=f"Visual indicator of usage volume over the past {RECENT_DAYS} days.",
+                help=f"Total raw uses in the last {RECENT_DAYS} days.",
                 format="%d uses",
                 min_value=0,
                 max_value=max_volume,
