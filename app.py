@@ -36,7 +36,7 @@ SVM_C = 0.05
 SEED = 42
 
 RECENT_DAYS = 30
-OLDER_DAYS = 60  # Fixed: Compares Day 0-30 against Day 31-60
+OLDER_DAYS = 60  # Compares Day 0-30 against Day 31-60
 TREND_MIN_FREQ = 3
 
 # Strictly matching the updated model parameters
@@ -463,6 +463,43 @@ if run_btn:
         
         clean_tags = [f"#{str(t).replace('#', '')}" for t in final_tags]
         st.code(" ".join(clean_tags), language="markdown")
+        
+        # --- NEW: Optional metrics breakdown for the generated tags ---
+        with st.expander("📊 View metrics for these recommendations"):
+            # Filter the main trend dataset for only the tags we just generated
+            rec_trend_df = system["trend_df"][system["trend_df"]["tag"].isin(final_tags)].copy()
+            
+            if not rec_trend_df.empty:
+                rec_trend_df["Hashtag"] = rec_trend_df["tag"].apply(lambda x: f"#{str(x).replace('#', '')}")
+                rec_trend_df["Velocity"] = (rec_trend_df["velocity"] - 1.0) * 100
+                rec_trend_df["Engagement"] = (rec_trend_df["engagement_growth"] - 1.0) * 100
+                rec_trend_df["Volume"] = rec_trend_df["recent_count"].astype(int)
+                
+                # Sort by volume so the biggest tags are at the top
+                rec_trend_df = rec_trend_df.sort_values("Volume", ascending=False)
+                
+                st.dataframe(
+                    rec_trend_df[["Hashtag", "Velocity", "Engagement", "Volume"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Hashtag": st.column_config.TextColumn("Hashtag"),
+                        "Velocity": st.column_config.NumberColumn(
+                            "Velocity", 
+                            format="%+d%%"
+                        ),
+                        "Engagement": st.column_config.NumberColumn(
+                            "Eng. Growth", 
+                            format="%+d%%"
+                        ),
+                        "Volume": st.column_config.NumberColumn(
+                            f"Uses (Last {RECENT_DAYS}d)", 
+                            format="%d"
+                        )
+                    }
+                )
+            else:
+                st.info("These hashtags are highly relevant to your text, but don't have enough recent volume to display trend metrics.")
 
 st.divider()
 
